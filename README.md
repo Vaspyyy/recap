@@ -70,6 +70,8 @@ Symbols come from the outline rules of [glint](https://github.com/Vaspyyy/glint)
 
 ## For coding agents
 
+A ready-made Claude Code skill is in [`skill/SKILL.md`](skill/SKILL.md). Install it with `mkdir -p ~/.claude/skills/recap && cp skill/SKILL.md ~/.claude/skills/recap/`.
+
 When its output isn't a terminal, recap prints plain text, so an agent can use it directly. To make it the default, add a line like this to the agent's instructions (`AGENTS.md`, `CLAUDE.md` or similar):
 
 ```markdown
