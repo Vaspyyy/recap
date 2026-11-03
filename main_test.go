@@ -260,7 +260,7 @@ func compare(a, b string) int {
 	// committed, the moved file is paired with the deleted one
 	commit("refactor")
 	out, _ = recap(t, "HEAD~1", "HEAD")
-	if !strings.Contains(out, "net/client.ts  moved from api.ts (git saw a delete and a new file; paired by their definitions)") ||
+	if !strings.Contains(out, "net/client.ts  moved from api.ts (git: deleted + new file; paired by their definitions)") ||
 		strings.Contains(out, "api.ts  deleted") {
 		t.Errorf("moved file not paired:\n%s", out)
 	}
@@ -447,11 +447,88 @@ func TestExtractionShowsTheDifferingLine(t *testing.T) {
 	write("s.go", "package s\n\nfunc Compare(a, b string) int {\n\treturn compare(a, b)\n}\n\nfunc compare(a, b string) int {\n"+strings.Replace(body, "lb := fold(b)", "lb := b", 1)+"}\n")
 	out, _ := recap(t)
 	for _, want := range []string{"(body taken from Compare, 1 line differs)", "- lb := fold(b)", "+ lb := b"} {
+		// (every differing line is shown, also the first)
 		if !strings.Contains(out, want) {
 			t.Errorf("missing %q in\n%s", want, out)
 		}
 	}
 	if strings.Contains(out, "−9") || strings.Contains(out, "−10") {
 		t.Errorf("Compare's count should follow git's (+1 −…), not the moved body:\n%s", out)
+	}
+}
+
+// Found while recording the preview: the first differing line of an
+// extracted body was dropped as if it were the signature.
+func TestExtractionShowsEveryDifferingLine(t *testing.T) {
+	write, commit := repo(t)
+	write("m.go", "package m\n\nfunc Parse(s string) int {\n\ts = trim(s)\n\tn := len(s)\n\tn = n * 2\n\treturn n\n}\n")
+	commit("first")
+	write("m.go", "package m\n\nfunc Parse(s string) int {\n\treturn parse(trim(s))\n}\n\nfunc parse(s string) int {\n\tn := len(s)\n\tn = n * 3\n\treturn n\n}\n")
+	out, _ := recap(t)
+	for _, want := range []string{"(body taken from Parse, 2 lines differ)", "- s = trim(s)", "- n = n * 2", "+ n = n * 3"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in\n%s", want, out)
+		}
+	}
+}
+
+// Regressions found by the final review round.
+func TestFinalRoundRegressions(t *testing.T) {
+	write, commit := repo(t)
+	write("r.py", "import functools\n\n\n@functools.cache\ndef load(path):\n    return open(path).read()\n\n\ndef a():\n    return 1\n\n\ndef round_cents(x):\n    return round(x, 2)\n\n\ndef parse_date(s):\n    y, m, d = s.split('-')\n    return int(y), int(m), int(d)\n")
+	write("legacy.ts", "export function oldHelper(x: number): number {\n  return x * 2;\n}\n")
+	write("tests/test_r.py", "def test_load():\n    pass\n")
+	write("item.go", "package m\n\ntype Item struct {\n\tKind  string\n\tTitle string\n\tLoc   string\n}\n")
+	commit("first")
+	write("r.py", "import functools\n\n\n@functools.lru_cache(maxsize=None)\ndef load(path):\n    return open(path).read()\n\n\ndef a():  # hi\n    return 1\n\n\ndef round_cents(amount):\n    return round(amount + 1e-9, 2)\n\n\ndef parse_data(blob):\n    if not blob:\n        raise ValueError('empty')\n    return blob.decode()\n")
+	os.Remove("legacy.ts")
+	write("tests/test_r.py", "def test_load():\n    pass\n\n\ndef test_more():\n    pass\n")
+	write("item.go", "package m\n\ntype Item struct {\n\tKind   string\n\tTitle  string\n\tLoc    string\n\tDetail []string\n}\n")
+	out, _ := recap(t)
+	for _, want := range []string{
+		"changed  def load  L5-6  +1 −1  (decorators changed)",
+		"+ return round(amount + 1e-9, 2)",
+		"removed  def parse_date",
+		"added    def parse_data",
+		"legacy.ts  deleted, 3 lines: function oldHelper (public)",
+		"added    def test_more  L5-6\n",
+		"changed  type Item  L3-8  +1 −0",
+		"+ Detail []string",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in\n%s", want, out)
+		}
+	}
+	for _, bad := range []string{"doc comment only", "changed  def a  L9-10  +1 −1  (public)", "was: def a", "renamed  def parse_date", "test_more  L5-6  (public"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("should not contain %q:\n%s", bad, out)
+		}
+	}
+	out, _ = recap(t, "--show", "load")
+	if !strings.Contains(out, "+@functools.lru_cache(maxsize=None)") {
+		t.Errorf("--show should include the decorator:\n%s", out)
+	}
+	for _, args := range [][]string{{"log", "--staged"}, {"--show", "a", "--show", "b"}} {
+		if _, code := recap(t, args...); code != 2 {
+			t.Errorf("recap %v should be an error", args)
+		}
+	}
+}
+
+func TestShowFromASubdirectory(t *testing.T) {
+	write, commit := repo(t)
+	write("sub/h.py", "def helper():\n    return 1\n")
+	write("h.py", "def helper():\n    return 1\n")
+	commit("first")
+	write("sub/h.py", "def helper():\n    return 2\n")
+	write("h.py", "def helper():\n    return 3\n")
+	os.Chdir("sub")
+	out, _ := recap(t, "--show", "h.py:helper")
+	if !strings.Contains(out, "+    return 2") || strings.Contains(out, "return 3") {
+		t.Errorf("h.py from sub/ is sub/h.py:\n%s", out)
+	}
+	out, _ = recap(t, "--show", "../h.py:helper")
+	if !strings.Contains(out, "+    return 3") {
+		t.Errorf("../h.py from sub/ is h.py:\n%s", out)
 	}
 }

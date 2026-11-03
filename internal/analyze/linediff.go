@@ -11,7 +11,38 @@ const maxCells = 16 << 20
 
 // LineDiff is a minimal line diff of a and b (longest common subsequence).
 // It returns nil when the texts are too large to compare this way.
-func LineDiff(a, b []string) []Op {
+func LineDiff(a, b []string) []Op { return LineDiffBy(a, b, nil) }
+
+// LineDiffBy compares lines by key(line) (nil: as they are) and reports
+// them as they are in b (kept lines) or a and b (changed ones).
+func LineDiffBy(a, b []string, key func(string) string) []Op {
+	if key != nil {
+		ka, kb := make([]string, len(a)), make([]string, len(b))
+		for i, l := range a {
+			ka[i] = key(l)
+		}
+		for i, l := range b {
+			kb[i] = key(l)
+		}
+		ops := LineDiff(ka, kb)
+		// put the real lines back
+		ia, ib := 0, 0
+		for k := range ops {
+			switch ops[k].Kind {
+			case ' ':
+				ops[k].Text = b[ib]
+				ia++
+				ib++
+			case '-':
+				ops[k].Text = a[ia]
+				ia++
+			case '+':
+				ops[k].Text = b[ib]
+				ib++
+			}
+		}
+		return ops
+	}
 	// common prefix and suffix first: most symbols change in a few places
 	pre := 0
 	for pre < len(a) && pre < len(b) && a[pre] == b[pre] {

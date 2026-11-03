@@ -119,6 +119,8 @@ func parse(args []string) (*opts, int, string) {
 			o.agent = true
 		case a == "--no-untracked":
 			o.noUntracked = true
+		case (a == "--show" || strings.HasPrefix(a, "--show=")) && o.showSet:
+			msg = "--show takes one target; run it once per symbol"
 		case a == "--show":
 			o.show, msg = value(&i, "--show")
 			o.showSet = true
@@ -150,6 +152,8 @@ func parse(args []string) (*opts, int, string) {
 	switch {
 	case o.nSet && o.sub != "log":
 		return nil, 2, "-n only applies to recap log (for the last N commits: recap log -n N)"
+	case o.sub == "log" && (o.staged || o.patch):
+		return nil, 2, "recap log summarises commits; --staged and -p don't apply"
 	case o.show != "" && o.sub == "log":
 		return nil, 2, "--show works on a diff or one commit (recap show <commit> --show name), not on recap log"
 	case o.sub == "show" && len(o.revs) > 1:
@@ -405,9 +409,9 @@ func runLog(out *bufio.Writer, top string, o *opts, color bool) int {
 		fmt.Fprintf(out, "%s  %s  %s  %s%s\n", bold(cm.Short, color), cm.Date, cm.Author, cm.Subject, merge)
 		if para, _, _ := strings.Cut(cm.Body, "\n\n"); para != "" { // the first paragraph says why
 			ls := strings.Split(para, "\n")
-			for k, l := range ls[:min(len(ls), 4)] {
-				if k == 3 && len(ls) > 4 {
-					l += " …"
+			for k, l := range ls[:min(len(ls), 6)] {
+				if k == 5 && len(ls) > 6 {
+					l += fmt.Sprintf(" … (+%d lines: recap show %s)", len(ls)-6, cm.Short)
 				}
 				fmt.Fprintln(out, "    "+l)
 			}
@@ -438,8 +442,17 @@ func show(out *bufio.Writer, comp *gitx.Comparison, files []*analyze.File, conte
 	if !hasName {
 		filePart, name = "", want
 		for _, f := range files { // "recap --show path": the whole file
-			if f.Path == want || strings.HasSuffix(f.Path, "/"+want) {
+			if f.Path == fromCwd(want) || f.Path == want || strings.HasSuffix(f.Path, "/"+want) {
 				return showFile(out, f, contents, color)
+			}
+		}
+	}
+	if filePart != "" {
+		if p := fromCwd(filePart); p != filePart {
+			for _, f := range files {
+				if f.Path == p {
+					filePart = p
+				}
 			}
 		}
 	}
@@ -541,6 +554,27 @@ func show(out *bufio.Writer, comp *gitx.Comparison, files []*analyze.File, conte
 	return 0
 }
 
+// fromCwd turns a path relative to the working directory into one
+// relative to the repository root, as git prints them.
+func fromCwd(p string) string {
+	top, err1 := gitx.Toplevel()
+	wd, err2 := os.Getwd()
+	if err1 != nil || err2 != nil {
+		return p
+	}
+	if real, err := filepath.EvalSymlinks(wd); err == nil {
+		wd = real
+	}
+	if real, err := filepath.EvalSymlinks(top); err == nil {
+		top = real
+	}
+	rel, err := filepath.Rel(top, filepath.Join(wd, p))
+	if err != nil || strings.HasPrefix(rel, "..") {
+		return p
+	}
+	return filepath.ToSlash(rel)
+}
+
 func fileMatches(p, want string) bool {
 	return want == "" || p == want || strings.HasSuffix(p, "/"+want)
 }
@@ -597,8 +631,20 @@ func printSymbol(out *bufio.Writer, t target, color bool) {
 			lines = analyze.Context(ops, 3)
 		}
 	}
-	for _, l := range lines {
-		fmt.Fprintln(out, colorize(visibleCR(l), color))
+	printLines(out, lines, color)
+}
+
+const maxShowLines = 400
+
+// printLines prints diff lines, clipping very long ones (minified code) and
+// stopping after maxShowLines.
+func printLines(out *bufio.Writer, lines []string, color bool) {
+	for k, l := range lines {
+		if k == maxShowLines {
+			fmt.Fprintf(out, "… %d more lines (use git diff for all of it)\n", len(lines)-k)
+			return
+		}
+		fmt.Fprintln(out, colorize(render.Clip(visibleCR(l), 400), color))
 	}
 }
 
@@ -638,14 +684,16 @@ func colorize(l string, color bool) string {
 
 func showFile(out *bufio.Writer, f *analyze.File, contents map[string]pair, color bool) int {
 	c := contents[f.Path]
+	if f.LineEndings != "" {
+		fmt.Fprintf(out, "%s: line endings only (%s), no other change\n", render.Path(f.Path), f.LineEndings)
+		return 0
+	}
 	ops := analyze.LineDiff(splitKeep(c.old), splitKeep(c.new))
 	if ops == nil || f.Binary {
 		return fail(f.Path + ": too large or binary for --show; use git diff -- " + f.Path)
 	}
 	fmt.Fprintf(out, "%s%s%s  (%s)\n", onOff(color, true), render.Path(f.Path), onOff(color, false), strings.TrimPrefix(render.Summary([]*analyze.File{f}, false), "1 file changed, "))
-	for _, l := range analyze.Context(ops, 3) {
-		fmt.Fprintln(out, colorize(l, color))
-	}
+	printLines(out, analyze.Context(ops, 3), color)
 	return 0
 }
 

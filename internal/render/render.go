@@ -81,6 +81,10 @@ func Summary(files []*analyze.File, color bool) string {
 			untracked++
 			continue // their lines aren't part of the diff
 		}
+		if f.Conflict && f.Hunks == nil && f.Added+f.Deleted == 0 {
+			conflicts++
+			continue // nothing of it is staged
+		}
 		n++
 		plus += f.Added
 		minus += f.Deleted
@@ -199,7 +203,7 @@ func status(f *analyze.File, c pal, compact bool) string {
 		case compact:
 			s += " (paired by its definitions)"
 		default:
-			s += " (git saw a delete and a new file; paired by their definitions)"
+			s += " (git: deleted + new file; paired by their definitions)"
 		}
 	case f.Untracked:
 		s = c.green + "untracked" + c.reset
@@ -382,12 +386,20 @@ func (w *writer) change(ch analyze.Change, ind string, withDetail bool) {
 		w.line("%s           %snow: %s%s", ind, c.faint, Clip(ch.NewSig, 200), c.reset)
 	}
 	if withDetail {
+		common := -1 // the indentation all the lines share is dropped; nesting stays visible
+		for _, l := range ch.Detail {
+			body := strings.ReplaceAll(l[1:], "\t", "    ")
+			if n := len(body) - len(strings.TrimLeft(body, " ")); common < 0 || n < common {
+				common = n
+			}
+		}
 		for _, l := range ch.Detail {
 			col := c.green
 			if l[0] == '-' {
 				col = c.red
 			}
-			w.line("%s           %s%s %s%s", ind, col, l[:1], Clip(strings.TrimSpace(l[1:]), 150), c.reset)
+			body := strings.TrimRight(strings.ReplaceAll(l[1:], "\t", "    "), " ")
+			w.line("%s           %s%s %s%s", ind, col, l[:1], Clip(body[min(common, len(body)):], 150), c.reset)
 		}
 	}
 }
@@ -422,7 +434,11 @@ func Compact(files []*analyze.File, o Options) string {
 		for _, f := range hidden[:min(len(hidden), 6)] {
 			names = append(names, Path(f.Path))
 		}
-		w.line("%s%s… and %s: %s (raise -b)%s", o.Indent, w.c.faint, plural(n, "more file"), strings.Join(names, ", "), w.c.reset)
+		more := ""
+		if n > len(names) {
+			more = fmt.Sprintf(" +%d more", n-len(names))
+		}
+		w.line("%s%s… and %s: %s%s (raise -b)%s", o.Indent, w.c.faint, plural(n, "more file"), strings.Join(names, ", "), more, w.c.reset)
 	}
 	return w.b.String()
 }
