@@ -66,11 +66,15 @@ type Side struct {
 // way git diff reads them.
 type Comparison struct {
 	Old, New Side
+	Desc     string   // how the header names it, when "old → new" isn't clear
 	DiffArgs []string // the revision arguments for git diff
 	Paths    []string // pathspecs after --
 }
 
 func (c *Comparison) Describe() string {
+	if c.Desc != "" {
+		return c.Desc
+	}
 	return c.Old.Label + " → " + c.New.Label
 }
 
@@ -147,7 +151,9 @@ func Compare(revs, paths []string, staged bool) (*Comparison, error) {
 			if err != nil {
 				return nil, fmt.Errorf("%s and %s have no common ancestor", a, b)
 			}
-			c.Old = Side{Rev: strings.TrimSpace(string(out)), Label: "merge-base of " + a + " and " + b}
+			base := strings.TrimSpace(string(out))
+			c.Old = Side{Rev: base, Label: "the branch point"}
+			c.Desc = fmt.Sprintf("%s since it branched off %s (at %s)", b, a, base[:min(len(base), 9)])
 		}
 		c.DiffArgs = []string{c.Old.Rev, c.New.Rev}
 	case len(revs) == 1:
@@ -495,4 +501,44 @@ func DiffContents(old, new []byte) (hunks []Hunk, added, deleted int, err error)
 		deleted += len(h.Removed)
 	}
 	return f[0].Hunks, added, deleted, nil
+}
+
+// MergeHead names the branch or commit being merged, if a merge is in progress.
+func MergeHead() string {
+	out, err := Run("rev-parse", "-q", "--verify", "MERGE_HEAD")
+	if err != nil || len(bytes.TrimSpace(out)) == 0 {
+		return ""
+	}
+	id := strings.TrimSpace(string(out))
+	if name, err := Run("name-rev", "--name-only", "--no-undefined", id); err == nil {
+		if n := strings.TrimSpace(string(name)); n != "" {
+			return n
+		}
+	}
+	return id[:min(len(id), 9)]
+}
+
+// Message is a commit's full message.
+func Message(rev string) (string, error) {
+	out, err := Run("log", "-1", "--format=%B", rev, "--")
+	return strings.TrimRight(string(out), "\n"), err
+}
+
+// ShowCommit resolves rev for `recap show`.
+func ShowCommit(rev string) (Commit, error) {
+	id, err := resolve(rev)
+	if err != nil {
+		return Commit{}, err
+	}
+	cs, err := Log(1, []string{id}, nil)
+	if err != nil || len(cs) == 0 {
+		return Commit{}, fmt.Errorf("%s: no such commit", rev)
+	}
+	return cs[0], nil
+}
+
+// HasCommits reports whether HEAD points at a commit.
+func HasCommits() bool {
+	_, err := resolve("HEAD")
+	return err == nil
 }

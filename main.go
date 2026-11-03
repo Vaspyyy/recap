@@ -1,5 +1,6 @@
 // recap summarises a git diff by symbol: which functions, types and
-// sections changed, were added, removed or renamed, instead of raw hunks.
+// sections changed, were added, removed, renamed or moved, instead of raw
+// hunks.
 package main
 
 import (
@@ -7,13 +8,12 @@ import (
 	"bytes"
 	"fmt"
 	"os"
-	"regexp"
+	"path/filepath"
 	"strconv"
 	"strings"
 
 	"golang.org/x/term"
 
-	"github.com/Vaspyyy/glint/outline"
 	"github.com/Vaspyyy/recap/internal/analyze"
 	"github.com/Vaspyyy/recap/internal/gitx"
 	"github.com/Vaspyyy/recap/internal/render"
@@ -22,22 +22,24 @@ import (
 const version = "0.1.0"
 
 const usage = `recap summarises a git diff by symbol: which functions, types and sections
-changed, were added, removed or renamed.
+changed, were added, removed, renamed or moved.
 
 usage: recap [flags] [<rev> | <rev> <rev> | <a>..<b> | <a>...<b>] [-- <path>...]
+       recap show [flags] [<commit>] [-- <path>...]
        recap log [-n N] [flags] [<revision range>] [-- <path>...]
 
-  recap                    working tree (and untracked files) compared with HEAD
+  recap                    the working tree (and untracked files) compared with HEAD
   recap --staged           what's staged for the next commit
   recap HEAD~3             the working tree compared with HEAD~3
   recap main...feature     what feature changed since it branched off main
-  recap log -n 5           the last five commits, one summary each
-  recap --show gpu.rs:readback    the real diff of one symbol
+  recap show abc123        what one commit did, with its message (default HEAD)
+  recap log -n 5           the last five commits, one line per file
+  recap --show gpu.rs:readback    the diff of one symbol
 
 flags:
   -s, --staged          compare the index (staged changes) with HEAD
-      --show TARGET     print the diff of one changed symbol: file:name, name, or a file
-  -p, --patch           print the overview, then the full diff
+      --show TARGET     print the diff of changed symbols: file:name, name, or a file
+  -p, --patch           print the overview, then git's full diff
   -n N                  recap log: how many commits (default 10)
   -b, --budget N        roughly how many lines the overview may use (default 150)
   -A, --agent           plain output without colors (default when not a terminal)
@@ -50,8 +52,9 @@ type opts struct {
 	staged, patch, agent, noUntracked bool
 	show                              string
 	budget, n                         int
+	nSet                              bool
 	revs, paths                       []string
-	log                               bool
+	sub                               string // "", "log" or "show"
 }
 
 func main() { os.Exit(run(os.Args[1:])) }
@@ -63,22 +66,24 @@ func fail(msg string) int {
 
 func parse(args []string) (*opts, int, string) {
 	o := &opts{budget: 150, n: 10}
-	// "log" as the first argument that isn't a flag: recap -A log -n 3
-	for i, a := range args {
+	// a subcommand is the first argument that isn't a flag (or a flag's value)
+	for i := 0; i < len(args); i++ {
+		a := args[i]
 		if a == "--" {
 			break
 		}
-		if a == "log" {
-			o.log = true
-			args = append(append([]string(nil), args[:i]...), args[i+1:]...)
-			break
-		}
-		if !strings.HasPrefix(a, "-") || a == "-" {
-			break
-		}
 		if a == "-b" || a == "--budget" || a == "-n" || a == "--max-count" || a == "--show" {
-			break // their value comes next; keep it simple and don't look further
+			i++
+			continue
 		}
+		if strings.HasPrefix(a, "-") && a != "-" {
+			continue
+		}
+		if a == "log" || a == "show" {
+			o.sub = a
+			args = append(append([]string(nil), args[:i]...), args[i+1:]...)
+		}
+		break
 	}
 	value := func(i *int, name string) (string, string) {
 		if *i+1 >= len(args) {
@@ -126,9 +131,11 @@ func parse(args []string) (*opts, int, string) {
 		case a == "-n" || a == "--max-count":
 			if v, msg = value(&i, a); msg == "" {
 				o.n, msg = number(v, a)
+				o.nSet = true
 			}
 		case strings.HasPrefix(a, "-n") && len(a) > 2:
 			o.n, msg = number(a[2:], "-n")
+			o.nSet = true
 		case strings.HasPrefix(a, "-") && a != "-":
 			msg = "unknown flag " + a + " (see recap --help)"
 		default:
@@ -138,8 +145,15 @@ func parse(args []string) (*opts, int, string) {
 			return nil, 2, msg
 		}
 	}
-	if o.show != "" && o.log {
-		return nil, 2, "--show works on a diff, not on recap log"
+	switch {
+	case o.nSet && o.sub != "log":
+		return nil, 2, "-n only applies to recap log (for the last N commits: recap log -n N)"
+	case o.show != "" && o.sub == "log":
+		return nil, 2, "--show works on a diff or one commit (recap show <commit> --show name), not on recap log"
+	case o.sub == "show" && len(o.revs) > 1:
+		return nil, 2, "recap show takes one commit"
+	case o.sub == "show" && o.staged:
+		return nil, 2, "recap show is about a commit; --staged doesn't apply"
 	}
 	return o, -1, ""
 }
@@ -161,20 +175,50 @@ func run(args []string) int {
 	color := human && os.Getenv("NO_COLOR") == ""
 	out := bufio.NewWriter(os.Stdout)
 	defer out.Flush()
-	if o.log {
-		return runLog(out, o, color)
+	if o.sub == "log" {
+		return runLog(out, top, o, color)
 	}
 
-	comp, err := gitx.Compare(o.revs, o.paths, o.staged)
-	if err != nil {
-		return fail(err.Error())
+	var comp *gitx.Comparison
+	var commit *gitx.Commit
+	if o.sub == "show" {
+		rev := "HEAD"
+		if len(o.revs) == 1 {
+			rev = o.revs[0]
+		}
+		if !gitx.HasCommits() {
+			return fail("no commits yet")
+		}
+		cm, err := gitx.ShowCommit(rev)
+		if err != nil {
+			return fail(err.Error())
+		}
+		commit = &cm
+		comp = gitx.CommitComparison(cm, o.paths)
+	} else {
+		if comp, err = gitx.Compare(o.revs, o.paths, o.staged); err != nil {
+			return fail(err.Error())
+		}
 	}
 	files, contents, err := collect(top, comp, !o.noUntracked && comp.New.Worktree)
 	if err != nil {
 		return fail(err.Error())
 	}
 	if o.show != "" {
-		return show(out, comp, files, contents, o.show, color)
+		return show(out, files, contents, o.show, color)
+	}
+
+	if commit != nil {
+		fmt.Fprintf(out, "%s  %s  %s\n", bold("commit "+commit.Short, color), commit.Author, commit.Age)
+		if msg, err := gitx.Message(commit.ID); err == nil {
+			for _, l := range strings.Split(msg, "\n") {
+				fmt.Fprintln(out, "    "+l)
+			}
+		}
+		if len(commit.Parents) > 1 {
+			fmt.Fprintln(out, "    (a merge: compared with its first parent)")
+		}
+		fmt.Fprintln(out)
 	}
 	head := "recap: " + comp.Describe() + ": "
 	if len(files) == 0 {
@@ -182,6 +226,11 @@ func run(args []string) int {
 		return 0
 	}
 	fmt.Fprintln(out, bold(head, color)+render.Summary(files, color))
+	if comp.New.Worktree || comp.New.Index {
+		if m := gitx.MergeHead(); m != "" {
+			fmt.Fprintf(out, "merge in progress: merging %s; resolve the conflicts, then commit (or git merge --abort)\n", m)
+		}
+	}
 	fmt.Fprintln(out)
 	fmt.Fprint(out, render.Files(files, render.Options{Color: color, Budget: o.budget - 2}))
 	if o.patch {
@@ -210,6 +259,10 @@ func collect(top string, comp *gitx.Comparison, untracked bool) ([]*analyze.File
 	if err != nil {
 		return nil, nil, err
 	}
+	var conflicts map[string]bool
+	if comp.New.Worktree || comp.New.Index {
+		conflicts = gitx.Conflicts(comp.Paths)
+	}
 	blobs, err := gitx.OpenBlobs()
 	if err != nil {
 		return nil, nil, err
@@ -218,6 +271,13 @@ func collect(top string, comp *gitx.Comparison, untracked bool) ([]*analyze.File
 	contents := map[string]pair{}
 	var files []*analyze.File
 	for _, f := range changed {
+		if conflicts[f.Path] && comp.New.Index {
+			// nothing of it is staged yet: the index holds the conflict's sides
+			a := analyze.Analyze(&gitx.File{Status: f.Status, Path: f.Path}, nil, nil, false)
+			a.Conflict = true
+			files = append(files, a)
+			continue
+		}
 		var old, new []byte
 		oldPath := f.Path
 		if f.OldPath != "" {
@@ -234,13 +294,9 @@ func collect(top string, comp *gitx.Comparison, untracked bool) ([]*analyze.File
 			}
 		}
 		contents[f.Path] = pair{old, new}
-		files = append(files, analyze.Analyze(f, old, new, false))
-	}
-	if comp.New.Worktree || comp.New.Index {
-		conflicts := gitx.Conflicts(comp.Paths)
-		for _, f := range files {
-			f.Conflict = conflicts[f.Path]
-		}
+		a := analyze.Analyze(f, old, new, false)
+		a.Conflict = conflicts[f.Path]
+		files = append(files, a)
 	}
 	if untracked {
 		paths, err := gitx.Untracked(comp.Paths)
@@ -248,7 +304,7 @@ func collect(top string, comp *gitx.Comparison, untracked bool) ([]*analyze.File
 			return nil, nil, err
 		}
 		for _, p := range paths {
-			data, err := os.ReadFile(top + "/" + p)
+			data, err := os.ReadFile(filepath.Join(top, p))
 			if err != nil {
 				continue // a socket, a broken link, a file that went away
 			}
@@ -294,8 +350,10 @@ func pairMoves(files []*analyze.File, contents map[string]pair) []*analyze.File 
 		}
 		f := &gitx.File{Status: 'R', OldPath: d.Path, Path: best.Path, Similarity: -1, Added: added, Deleted: deleted, Hunks: hunks,
 			OldMode: d.OldMode, NewMode: best.NewMode}
-		merged := analyze.Analyze(f, old, new, false)
+		merged := analyze.Analyze(f, old, new, false) // as a pair, not as a new file
+		merged.Untracked = best.Untracked
 		merged.Conflict = best.Conflict
+		merged.PairedFrom, merged.PairedNew = d.File, best.File
 		used[d], used[best] = true, true
 		contents[best.Path] = pair{old, new}
 		for i, x := range files {
@@ -306,7 +364,7 @@ func pairMoves(files []*analyze.File, contents map[string]pair) []*analyze.File 
 	}
 	var out []*analyze.File
 	for _, f := range files {
-		if !(used[f] && f.Status == 'D') {
+		if !(used[f] && f.Status == 'D' && f.PairedFrom == nil) {
 			out = append(out, f)
 		}
 	}
@@ -320,13 +378,15 @@ func ext(p string) string {
 	return ""
 }
 
-func runLog(out *bufio.Writer, o *opts, color bool) int {
+func runLog(out *bufio.Writer, top string, o *opts, color bool) int {
+	if !gitx.HasCommits() && len(o.revs) == 0 {
+		fmt.Fprintln(out, "recap log: no commits yet")
+		return 0
+	}
 	commits, err := gitx.Log(o.n, o.revs, o.paths)
 	if err != nil {
 		return fail(err.Error())
 	}
-	top, _ := gitx.Toplevel()
-	budget := o.budget
 	for k, cm := range commits {
 		if k > 0 {
 			fmt.Fprintln(out)
@@ -340,7 +400,7 @@ func runLog(out *bufio.Writer, o *opts, color bool) int {
 		if err != nil {
 			return fail(err.Error())
 		}
-		per := max(3, budget/max(1, len(commits))-2)
+		per := max(3, o.budget/max(1, len(commits))-2)
 		fmt.Fprint(out, render.Compact(files, render.Options{Color: color, Budget: per, Indent: "  "}))
 	}
 	if len(commits) == 0 {
@@ -349,90 +409,106 @@ func runLog(out *bufio.Writer, o *opts, color bool) int {
 	return 0
 }
 
-var hunkHdrRe = regexp.MustCompile(`^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@`)
+// a symbol --show can print: a change, or a definition of a new or deleted file
+type target struct {
+	f    *analyze.File
+	ch   analyze.Change
+	name string
+}
 
-// show prints the diff of one changed symbol (or one file).
-func show(out *bufio.Writer, comp *gitx.Comparison, files []*analyze.File, contents map[string]pair, target string, color bool) int {
-	filepart, sym, hasSym := strings.Cut(target, ":")
-	if !hasSym {
-		filepart, sym = "", target
+// show prints the diff of the changed symbols matching target, or of a file.
+func show(out *bufio.Writer, files []*analyze.File, contents map[string]pair, want string, color bool) int {
+	filePart, name, hasName := strings.Cut(want, ":")
+	if !hasName {
+		filePart, name = "", want
+		for _, f := range files { // "recap --show path": the whole file
+			if f.Path == want || strings.HasSuffix(f.Path, "/"+want) {
+				return showFile(out, f, contents, color)
+			}
+		}
 	}
-	var cands []*analyze.File
+	var all []target
 	for _, f := range files {
-		if fileMatches(f.Path, filepart) || (f.OldPath != "" && fileMatches(f.OldPath, filePart(filepart))) {
-			cands = append(cands, f)
+		if !fileMatches(f.Path, filePart) && !(f.OldPath != "" && fileMatches(f.OldPath, filePart)) {
+			continue
 		}
-	}
-	// "recap --show path": the whole file
-	if !hasSym {
-		for _, f := range files {
-			if f.Path == target || strings.HasSuffix(f.Path, "/"+target) {
-				return showFile(out, comp, f, contents, color)
-			}
-		}
-	}
-	type hit struct {
-		f  *analyze.File
-		ch analyze.Change
-	}
-	var hits []hit
-	for _, f := range cands {
 		for _, ch := range f.Changes {
-			if nameMatches(ch.Name, sym) || (ch.OldName != "" && nameMatches(ch.OldName, sym)) {
-				hits = append(hits, hit{f, ch})
+			all = append(all, target{f, ch, ch.Name})
+			if ch.OldName != "" {
+				all = append(all, target{f, ch, ch.OldName})
 			}
 		}
-		if f.Status == 'A' || f.Untracked || f.Status == 'D' {
-			data := contents[f.Path].new
-			sign := "+"
+		for _, d := range f.Defs {
+			ch := analyze.Change{What: "added", Kind: d.Kind, Name: d.Name, Line: d.Line, End: d.End, NewText: d.Text, FromFile: d.From}
 			if f.Status == 'D' {
-				data, sign = contents[f.Path].old, "-"
+				ch = analyze.Change{What: "removed", Kind: d.Kind, Name: d.Name, Line: d.Line, End: d.End, OldLine: d.Line, OldEnd: d.End,
+					OldText: d.Text, MovedTo: d.MovedTo}
 			}
-			syms := outline.Parse(f.Path, data, 5000)
-			for i, s := range syms {
-				if nameMatches(outline.Qualified(syms, i), sym) {
-					printLines(out, f.Path, data, s, sign, color)
-					return 0
+			if d.From != "" { // the other copy, for a real diff of the move
+				for _, g := range files {
+					for _, gc := range g.Changes {
+						if g.Path == d.From && gc.What == "removed" && gc.Name == d.Name {
+							ch.OldText, ch.OldLine, ch.OldEnd = gc.OldText, gc.OldLine, gc.OldEnd
+						}
+					}
+					for _, gd := range g.Defs {
+						if g.Path == d.From && gd.Name == d.Name && g.Status == 'D' {
+							ch.OldText, ch.OldLine, ch.OldEnd = gd.Text, gd.Line, gd.End
+						}
+					}
 				}
 			}
+			all = append(all, target{f, ch, d.Name})
+		}
+	}
+	// exact names first; otherwise the last part ("open" finds Repo.open)
+	var hits []target
+	seen := map[string]bool{}
+	for _, exact := range []bool{true, false} {
+		for _, t := range all {
+			k := t.f.Path + "\x00" + t.ch.What + "\x00" + t.ch.Name
+			if seen[k] {
+				continue
+			}
+			if t.name == name || !exact && strings.HasSuffix(t.name, "."+name) {
+				hits = append(hits, t)
+				seen[k] = true
+			}
+		}
+		if len(hits) > 0 {
+			break
 		}
 	}
 	switch {
 	case len(hits) == 0:
 		var names []string
-		for _, f := range cands {
-			for _, ch := range f.Changes {
-				names = append(names, f.Path+":"+ch.Name)
+		for _, t := range all {
+			if t.name == t.ch.Name {
+				names = append(names, t.f.Path+":"+t.ch.Name)
 			}
 		}
 		if len(names) == 0 {
-			return fail("nothing changed matches " + strconv.Quote(target))
+			return fail("nothing changed matches " + strconv.Quote(want))
 		}
 		if len(names) > 12 {
 			names = append(names[:12], fmt.Sprintf("… +%d more", len(names)-12))
 		}
-		return fail("no changed symbol matches " + strconv.Quote(target) + "; changed: " + strings.Join(names, ", "))
-	case len(hits) > 1 && !allSameFile(len(hits), func(i int) string { return hits[i].f.Path }):
+		return fail("no changed symbol matches " + strconv.Quote(want) + "; changed: " + strings.Join(names, ", "))
+	case len(hits) > 8:
 		var names []string
-		for _, h := range hits {
-			names = append(names, h.f.Path+":"+h.ch.Name)
+		for _, t := range hits[:8] {
+			names = append(names, t.f.Path+":"+t.ch.Name)
 		}
-		return fail(strconv.Quote(target) + " matches several symbols; pick one: " + strings.Join(names, ", "))
+		return fail(fmt.Sprintf("%q matches %d symbols; be more specific, e.g. %s", want, len(hits), strings.Join(names, ", ")))
 	}
-	for _, h := range hits {
-		where := fmt.Sprintf("%s L%d-%d", h.f.Path, h.ch.Line, h.ch.End)
-		switch h.ch.What {
-		case "removed":
-			where = fmt.Sprintf("%s, was L%d-%d", h.f.Path, h.ch.OldLine, h.ch.OldEnd)
-		case "changed", "renamed", "moved":
-			if h.ch.OldLine != h.ch.Line || h.ch.OldEnd != h.ch.End {
-				where += fmt.Sprintf(", was L%d-%d", h.ch.OldLine, h.ch.OldEnd)
-			}
+	if len(hits) > 1 {
+		fmt.Fprintf(out, "%d matches for %s\n\n", len(hits), strconv.Quote(want))
+	}
+	for k, t := range hits {
+		if k > 0 {
+			fmt.Fprintln(out)
 		}
-		fmt.Fprintf(out, "%s%s %s%s  (%s)\n", boldOn(color), h.ch.What, render.Label(h.ch.Kind, h.ch.Name), boldOff(color), where)
-		for _, l := range symbolDiff(h.f, h.ch, contents[h.f.Path]) {
-			fmt.Fprintln(out, colorize(l, color))
-		}
+		printSymbol(out, t, color)
 	}
 	return 0
 }
@@ -441,125 +517,72 @@ func fileMatches(p, want string) bool {
 	return want == "" || p == want || strings.HasSuffix(p, "/"+want)
 }
 
-func filePart(s string) string { return s }
-
-func nameMatches(name, want string) bool {
-	return name == want || strings.HasSuffix(name, "."+want)
-}
-
-func allSameFile(n int, path func(int) string) bool {
-	for i := 1; i < n; i++ {
-		if path(i) != path(0) {
-			return false
+// printSymbol prints one symbol's diff: against its old version, or against
+// where its body came from (a move or an extraction).
+func printSymbol(out *bufio.Writer, t target, color bool) {
+	ch := t.ch
+	where := render.Path(t.f.Path) + " L" + render.Span(ch.Line, ch.End)
+	against := ""
+	switch {
+	case ch.What == "removed" && ch.MovedTo != "":
+		where = render.Path(t.f.Path) + ", was L" + render.Span(ch.Line, ch.End)
+		against = "the diff to its new copy in " + render.Path(ch.MovedTo)
+	case ch.What == "removed":
+		where = render.Path(t.f.Path) + ", was L" + render.Span(ch.Line, ch.End)
+	case ch.FromFile != "":
+		against = "the diff from its old copy in " + render.Path(ch.FromFile) + " L" + render.Span(ch.OldLine, ch.OldEnd)
+	case ch.From != "":
+		against = "the diff from " + ch.From + " (L" + render.Span(ch.OldLine, ch.OldEnd) + " before), where its body came from"
+	case ch.What != "added" && ch.OldLine > 0 && (ch.OldLine != ch.Line || ch.OldEnd != ch.End):
+		where += ", was L" + render.Span(ch.OldLine, ch.OldEnd)
+	}
+	label := render.Label(ch.Kind, ch.Name)
+	if ch.What == "renamed" {
+		label = render.Label(ch.Kind, ch.OldName) + " → " + ch.Name
+	}
+	fmt.Fprintf(out, "%s%s %s%s  (%s)\n", onOff(color, true), ch.What, label, onOff(color, false), where)
+	if against != "" {
+		fmt.Fprintln(out, "  "+against+":")
+	}
+	var lines []string
+	switch {
+	case ch.What == "moved":
+		lines = []string{fmt.Sprintf("  (unchanged; it was at L%s)", render.Span(ch.OldLine, ch.OldEnd))}
+	case ch.What == "added" && ch.OldText == nil:
+		for _, l := range ch.NewText {
+			lines = append(lines, "+"+l)
+		}
+	case ch.What == "removed" && ch.NewText == nil:
+		for _, l := range ch.OldText {
+			lines = append(lines, "-"+l)
+		}
+	default:
+		ops := analyze.LineDiff(ch.OldText, ch.NewText)
+		if ops == nil { // too large to compare here
+			for _, l := range ch.OldText {
+				lines = append(lines, "-"+l)
+			}
+			for _, l := range ch.NewText {
+				lines = append(lines, "+"+l)
+			}
+		} else {
+			lines = analyze.Context(ops, 3)
 		}
 	}
-	return true
+	for _, l := range lines {
+		fmt.Fprintln(out, colorize(l, color))
+	}
 }
 
-func boldOn(c bool) string {
-	if c {
+func onOff(color, on bool) string {
+	switch {
+	case !color:
+		return ""
+	case on:
 		return "\x1b[1m"
 	}
-	return ""
+	return "\x1b[0m"
 }
-
-func boldOff(c bool) string {
-	if c {
-		return "\x1b[0m"
-	}
-	return ""
-}
-
-// symbolDiff is the diff of one symbol: its changed lines with up to three
-// unchanged lines around them, cut to the symbol's own lines.
-func symbolDiff(f *analyze.File, ch analyze.Change, c pair) []string {
-	oldLines := strings.Split(string(c.old), "\n")
-	newLines := strings.Split(string(c.new), "\n")
-	lineAt := func(ls []string, n int) string {
-		if n >= 1 && n <= len(ls) {
-			return ls[n-1]
-		}
-		return ""
-	}
-	switch ch.What {
-	case "removed":
-		var out []string
-		for n := ch.OldLine; n <= ch.OldEnd; n++ {
-			out = append(out, "-"+lineAt(oldLines, n))
-		}
-		return out
-	case "added":
-		var out []string
-		for n := ch.Line; n <= ch.End; n++ {
-			out = append(out, "+"+lineAt(newLines, n))
-		}
-		return out
-	case "moved":
-		return []string{fmt.Sprintf("  (unchanged; moved from L%d-%d to L%d-%d)", ch.OldLine, ch.OldEnd, ch.Line, ch.End)}
-	}
-	// walk the symbol's new lines; the -U0 hunks inside it say what changed
-	var seq []string
-	ctx := []bool{}
-	cur := ch.Line
-	emitContext := func(to int) {
-		for ; cur <= to && cur <= ch.End; cur++ {
-			seq = append(seq, " "+lineAt(newLines, cur))
-			ctx = append(ctx, true)
-		}
-	}
-	for _, h := range f.Hunks {
-		oldTo := h.OldStart + max(h.OldLines, 1) - 1
-		newFrom, newTo := h.NewStart, h.NewStart+h.NewLines-1
-		if h.NewLines == 0 {
-			newFrom, newTo = h.NewStart+1, h.NewStart // a deletion sits after line NewStart
-		}
-		inOld := overlaps(h.OldStart, oldTo, ch.OldLine, ch.OldEnd) && h.OldLines > 0
-		inNew := h.NewLines > 0 && overlaps(newFrom, newTo, ch.Line, ch.End)
-		if !inOld && !inNew {
-			continue
-		}
-		if newFrom > ch.End+1 || newTo < ch.Line-1 {
-			continue // a removal elsewhere (for renames: the old copy)
-		}
-		emitContext(newFrom - 1)
-		for _, l := range h.Removed {
-			seq = append(seq, "-"+l)
-			ctx = append(ctx, false)
-		}
-		for _, l := range h.Added {
-			seq = append(seq, "+"+l)
-			ctx = append(ctx, false)
-		}
-		cur = max(cur, newTo+1)
-	}
-	emitContext(ch.End)
-	// keep three lines of context around changes, mark what's left out
-	var out []string
-	for i := 0; i < len(seq); i++ {
-		if !ctx[i] {
-			out = append(out, seq[i])
-			continue
-		}
-		near := false
-		for d := -3; d <= 3; d++ {
-			if j := i + d; j >= 0 && j < len(seq) && !ctx[j] {
-				near = true
-				break
-			}
-		}
-		if i == 0 && ctx[0] {
-			near = true // the symbol's first line names it
-		}
-		if near {
-			out = append(out, seq[i])
-		} else if len(out) == 0 || out[len(out)-1] != "  ⋮" {
-			out = append(out, "  ⋮")
-		}
-	}
-	return out
-}
-
-func overlaps(a, b, c, d int) bool { return c <= d && a <= d && c <= b }
 
 func colorize(l string, color bool) string {
 	if !color {
@@ -576,45 +599,23 @@ func colorize(l string, color bool) string {
 	return l
 }
 
-func printLines(out *bufio.Writer, path string, data []byte, s outline.Symbol, sign string, color bool) {
-	what := "added"
-	if sign == "-" {
-		what = "removed"
+func showFile(out *bufio.Writer, f *analyze.File, contents map[string]pair, color bool) int {
+	c := contents[f.Path]
+	ops := analyze.LineDiff(splitKeep(c.old), splitKeep(c.new))
+	if ops == nil || f.Binary {
+		return fail(f.Path + ": too large or binary for --show; use git diff -- " + f.Path)
 	}
-	fmt.Fprintf(out, "%s%s %s%s  (%s, L%d-%d)\n", boldOn(color), what, render.Label(s.Kind, s.Name), boldOff(color), path, s.Line, s.End)
-	lines := strings.Split(string(data), "\n")
-	for i := s.Line - 1; i < s.End && i < len(lines); i++ {
-		fmt.Fprintln(out, colorize(sign+lines[i], color))
+	fmt.Fprintf(out, "%s%s%s  (%s)\n", onOff(color, true), render.Path(f.Path), onOff(color, false), strings.TrimPrefix(render.Summary([]*analyze.File{f}, false), "1 file changed, "))
+	for _, l := range analyze.Context(ops, 3) {
+		fmt.Fprintln(out, colorize(l, color))
 	}
-}
-
-func showFile(out *bufio.Writer, comp *gitx.Comparison, f *analyze.File, contents map[string]pair, color bool) int {
-	if f.Untracked {
-		for _, l := range strings.Split(strings.TrimSuffix(string(contents[f.Path].new), "\n"), "\n") {
-			fmt.Fprintln(out, colorize("+"+l, color))
-		}
-		return 0
-	}
-	paths := []string{f.Path}
-	if f.OldPath != "" {
-		paths = append(paths, f.OldPath)
-	}
-	patch, err := gitx.FullDiff(comp, 3, color, paths)
-	if err != nil {
-		return fail(err.Error())
-	}
-	out.Write(patch)
 	return 0
 }
 
-func atoi(s string) int {
-	n, _ := strconv.Atoi(s)
-	return n
-}
-
-func count(s string) int {
+func splitKeep(b []byte) []string {
+	s := strings.TrimSuffix(string(b), "\n")
 	if s == "" {
-		return 1
+		return nil
 	}
-	return atoi(s)
+	return strings.Split(s, "\n")
 }

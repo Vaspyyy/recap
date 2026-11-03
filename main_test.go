@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -169,7 +170,7 @@ func TestRangesAndLog(t *testing.T) {
 		t.Errorf("got:\n%s", out)
 	}
 	out, _ = recap(t, "log", "-n", "5")
-	for _, want := range []string{"second", "gpu.go  +", "renamed Upload → UploadScene", "removed Dispatch", "first", "gpu.go  new, 23 lines"} {
+	for _, want := range []string{"second", "gpu.go  modified, +", "renamed Upload → UploadScene", "removed Dispatch", "first", "gpu.go  new, 23 lines"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("log: missing %q in\n%s", want, out)
 		}
@@ -248,9 +249,9 @@ func compare(a, b string) int {
 	out, _ := recap(t)
 	for _, want := range []string{
 		"added    func compare  L7-14  (body taken from Compare, 1 line differs)",
-		"removed  def apply_coupon  was L5-9  (moved to discounts.py)",
+		"removed  def apply_coupon  was L5-9  (public; moved to discounts.py, unchanged)",
 		"discounts.py  untracked, 5 lines: def apply_coupon (from cart.py)",
-		"net/client.ts  moved from api.ts (git saw a delete and a new file; paired by their definitions), +4 −4",
+		"net/client.ts  moved from api.ts (the new copy is untracked; paired by their definitions), +4 −4",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("missing %q in\n%s", want, out)
@@ -290,5 +291,93 @@ func TestConflictsWhitespaceAndCounts(t *testing.T) {
 	out, _ = recap(t)
 	if !strings.Contains(out, "m.go  merge conflict (unresolved)") || !strings.Contains(out, "1 file with merge conflicts") {
 		t.Errorf("conflict not flagged:\n%s", out)
+	}
+}
+
+// Regressions found by the first review round.
+func TestFirstRoundRegressions(t *testing.T) {
+	write, commit := repo(t)
+	write("cart.py", "class Cart:\n    pass\n\n\ndef apply_coupon(cart, code):\n    if code == 'WELCOME':\n        return cart.total() * 0.9\n    return cart.total()\n")
+	write("money.py", "def round_cents(x):\n    return round(x, 2)\n\n\ndef format_price(x):\n    return f'{x:.2f} EUR'\n")
+	write("api.ts", "export const formatName = (u: User) => u.name.trim();\n\nexport function other() {\n  return 1;\n}\n")
+	write("shapes.rs", "pub struct Circle {\n    pub r: f64,\n}\n\nimpl Circle {\n    pub fn area(&self) -> f64 {\n        3.14 * self.r * self.r\n    }\n\n    pub fn name(&self) -> &str {\n        \"circle\"\n    }\n}\n")
+	commit("first")
+	// moved to another file with a new parameter: the move must show the signature
+	write("cart.py", "class Cart:\n    pass\n")
+	write("discounts.py", "def apply_coupon(cart, code, discounts):\n    d = discounts.get(code)\n    return d.apply(cart.total()) if d else cart.total()\n")
+	// renamed with a new parameter; renamed with an identical one-line body
+	write("money.py", "def round_cents(x):\n    return round(x, 2)\n\n\ndef format_amount(amount, currency='EUR'):\n    return f'{amount:.2f} {currency}'\n")
+	write("api.ts", "export const displayName = (u: User) => u.name.trim();\n\nexport function other() {\n  return 1;\n}\n")
+	// a doc comment belongs to the function below it; a one-line change counts one line
+	write("shapes.rs", "pub struct Circle {\n    pub r: f64,\n}\n\nimpl Circle {\n    pub fn area(&self) -> f64 {\n        std::f64::consts::PI * self.r * self.r\n    }\n\n    /// The shape's name.\n    pub fn name(&self) -> String {\n        \"circle\".to_string()\n    }\n}\n")
+	out, _ := recap(t)
+	for _, want := range []string{
+		"removed  def apply_coupon  was L5-8  (public; moved to discounts.py, 4 lines differ)",
+		"def apply_coupon (from cart.py, signature changed)",
+		"renamed  def format_price → format_amount  L5-6  +2 −2  (public; rewritten)",
+		"was: def format_price(x):",
+		"renamed  const formatName → displayName  L1  (public)",
+		"changed  fn Circle.area  L6-8  +1 −1",
+		"changed  fn Circle.name  L11-13  +3 −2",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "lines outside definitions") {
+		t.Errorf("the doc comment should belong to Circle.name:\n%s", out)
+	}
+	// --show: exactly the symbol, and a moved one against its old copy
+	out, _ = recap(t, "--show", "Circle.area")
+	if !strings.Contains(out, "-        3.14 * self.r * self.r") || strings.Contains(out, "circle") {
+		t.Errorf("--show Circle.area bleeds or misses:\n%s", out)
+	}
+	out, _ = recap(t, "--show", "apply_coupon")
+	if !strings.Contains(out, "2 matches") || !strings.Contains(out, "-def apply_coupon(cart, code):") || !strings.Contains(out, "+def apply_coupon(cart, code, discounts):") {
+		t.Errorf("--show of a moved function should diff both copies:\n%s", out)
+	}
+	// -n without log, log and show in an empty repository
+	if _, code := recap(t, "-n", "3"); code != 2 {
+		t.Errorf("-n without log should be an error")
+	}
+	commit("second")
+	out, _ = recap(t, "show")
+	if !strings.Contains(out, "commit ") || !strings.Contains(out, "    second") || !strings.Contains(out, "renamed  def format_price → format_amount") {
+		t.Errorf("recap show:\n%s", out)
+	}
+}
+
+func TestEmptyRepoAndPathQuoting(t *testing.T) {
+	write, _ := repo(t)
+	if out, _ := recap(t, "log"); !strings.Contains(out, "no commits yet") {
+		t.Errorf("log in an empty repo: %q", out)
+	}
+	write("we ird\ttab.py", "x = 1\n")
+	out, _ := recap(t)
+	if !strings.Contains(out, `"we ird\ttab.py"  untracked`) {
+		t.Errorf("a tab in a file name must be quoted:\n%s", out)
+	}
+}
+
+func TestBudgetIsFair(t *testing.T) {
+	write, commit := repo(t)
+	var big, big2 strings.Builder
+	for i := range 400 {
+		fmt.Fprintf(&big, "def f%d():\n    return %d\n\n\n", i, i)
+		if i >= 10 {
+			fmt.Fprintf(&big2, "def f%d():\n    return %d\n\n\n", i, i+1)
+		}
+	}
+	write("big.py", big.String())
+	write("small.py", "def g():\n    return 1\n")
+	commit("first")
+	write("big.py", big2.String())
+	write("small.py", "def g(x):\n    return x\n")
+	out, _ := recap(t)
+	if !strings.Contains(out, "changed  def g  L1-2") {
+		t.Errorf("a big file starved a small one:\n%s", out)
+	}
+	if !strings.Contains(out, "removed  def f0") || !strings.Contains(out, "390 changed (each +1 −1)") && !strings.Contains(out, "changed (each +1 −1)") {
+		t.Errorf("removals must come first and the rest be summarised:\n%s", out)
 	}
 }
