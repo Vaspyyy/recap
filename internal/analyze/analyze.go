@@ -15,19 +15,35 @@ import (
 
 // Change is something that happened to one symbol.
 type Change struct {
-	What    string // "changed", "added", "removed", "renamed", "moved"
-	Kind    string // the symbol's kind: "fn", "func", "class", "h2", …
-	Name    string // qualified: "Repo.open"
-	OldName string // for renames
-	Line    int    // where it is now (where it was, for removed)
-	End     int
-	OldLine int // where it was (0 for added)
-	OldEnd  int
-	Plus    int // added and removed lines inside it (its own, not its children's)
-	Minus   int
-	OldSig  string // set when the signature changed
-	NewSig  string
-	Members int // for added and removed classes and the like: how many symbols inside
+	What     string // "changed", "added", "removed", "renamed", "moved"
+	Kind     string // the symbol's kind: "fn", "func", "class", "h2", …
+	Name     string // qualified: "Repo.open"
+	OldName  string // for renames
+	Line     int    // where it is now (where it was, for removed)
+	End      int
+	OldLine  int // where it was (0 for added)
+	OldEnd   int
+	Plus     int // added and removed lines inside it (its own, not its children's)
+	Minus    int
+	OldSig   string // set when the signature changed
+	NewSig   string
+	Members  int    // for added and removed classes and the like: how many symbols inside
+	From     string // added: the symbol in this file its body came from (an extracted function)
+	FromFile string // added: the file it was moved from
+	Differs  int    // with From: how many lines differ from where it came from
+	MovedTo  string // removed: the file it went to
+	Note     string // "whitespace only"
+	body     []string
+}
+
+// Def is a definition in a new or deleted file.
+type Def struct {
+	Kind, Name string
+	Line, End  int
+	Top        bool   // listed in the file's line (top level; for Markdown also ## sections)
+	From       string // new files: where it was removed from
+	MovedTo    string // deleted files: where it went
+	body       []string
 }
 
 // File is the analysis of one file.
@@ -41,8 +57,9 @@ type File struct {
 	TopPlus   int // changed lines outside any symbol
 	TopMinus  int
 	TopLines  []string // a few of them, when there are few ("+use std::io;")
-	Symbols   []string // new and deleted files: their top-level symbols
+	Defs      []Def    // new and deleted files: their definitions
 	Submodule bool
+	Conflict  bool // unmerged: a merge conflict waiting to be resolved
 }
 
 var (
@@ -95,11 +112,11 @@ func Analyze(f *gitx.File, old, new []byte, untracked bool) *File {
 	oldSyms := outline.Parse(oldPath, old, 5000)
 	newSyms := outline.Parse(f.Path, new, 5000)
 	if f.Status == 'A' || untracked {
-		a.Symbols = topLevel(newSyms)
+		a.Defs = defs(newSyms, splitLines(new))
 		return a
 	}
 	if f.Status == 'D' {
-		a.Symbols = topLevel(oldSyms)
+		a.Defs = defs(oldSyms, splitLines(old))
 		return a
 	}
 	a.compare(oldSyms, newSyms, splitLines(old), splitLines(new))
@@ -129,20 +146,115 @@ func label(s outline.Symbol) string {
 	return s.Kind + " " + s.Name
 }
 
-func topLevel(syms []outline.Symbol) []string {
+func defs(syms []outline.Symbol, lines []string) []Def {
+	var out []Def
+	for i, s := range syms {
+		top := s.Parent < 0 || (s.Kind == "h2" && syms[s.Parent].Kind == "h1")
+		out = append(out, Def{Kind: s.Kind, Name: outline.Qualified(syms, i), Line: s.Line, End: s.End, Top: top,
+			body: body(lines[max(0, s.Line-1):min(len(lines), s.End)])})
+	}
+	return out
+}
+
+// Symbols lists a new or deleted file's top-level definitions for display.
+func (a *File) Symbols() []string {
 	var out []string
-	for _, s := range syms {
-		// top-level symbols; for Markdown the title and its sections
-		if s.Parent >= 0 && !(s.Kind == "h2" && syms[s.Parent].Kind == "h1") {
+	for _, d := range a.Defs {
+		if !d.Top && d.From == "" && d.MovedTo == "" {
 			continue
 		}
-		l := label(s)
-		if strings.HasPrefix(s.Kind, "h") && len(s.Kind) == 2 {
-			l = strings.Repeat("#", int(s.Kind[1]-'0')) + " " + s.Name
+		l := d.Kind + " " + d.Name
+		if strings.HasPrefix(d.Kind, "h") && len(d.Kind) == 2 {
+			l = strings.Repeat("#", int(d.Kind[1]-'0')) + " " + d.Name
+		}
+		switch {
+		case d.From != "":
+			l += " (from " + d.From + ")"
+		case d.MovedTo != "":
+			l += " (moved to " + d.MovedTo + ")"
 		}
 		out = append(out, l)
 	}
 	return out
+}
+
+// Link connects definitions removed from one file with the same ones added
+// to another: "moved to shop/discounts.py".
+func Link(files []*File) {
+	type ref struct {
+		f   *File
+		ch  *Change
+		def *Def
+	}
+	removed := map[string][]ref{}
+	for _, f := range files {
+		for i := range f.Changes {
+			if ch := &f.Changes[i]; ch.What == "removed" {
+				removed[ch.Kind+"\x00"+ch.Name] = append(removed[ch.Kind+"\x00"+ch.Name], ref{f: f, ch: ch})
+			}
+		}
+		if f.Status == 'D' {
+			for i := range f.Defs {
+				d := &f.Defs[i]
+				removed[d.Kind+"\x00"+d.Name] = append(removed[d.Kind+"\x00"+d.Name], ref{f: f, def: d})
+			}
+		}
+	}
+	take := func(key, path string) *ref {
+		for k, r := range removed[key] {
+			if r.f.Path != path {
+				removed[key] = append(removed[key][:k:k], removed[key][k+1:]...)
+				return &r
+			}
+		}
+		return nil
+	}
+	for _, f := range files {
+		for i := range f.Changes {
+			ch := &f.Changes[i]
+			if ch.What != "added" || ch.From != "" {
+				continue
+			}
+			if r := take(ch.Kind+"\x00"+ch.Name, f.Path); r != nil {
+				ch.FromFile = r.f.Path
+				if r.ch != nil {
+					r.ch.MovedTo = f.Path
+				} else {
+					r.def.MovedTo = f.Path
+				}
+			}
+		}
+		if f.Status == 'A' || f.Untracked {
+			for i := range f.Defs {
+				d := &f.Defs[i]
+				if r := take(d.Kind+"\x00"+d.Name, f.Path); r != nil {
+					d.From = r.f.Path
+					if r.ch != nil {
+						r.ch.MovedTo = f.Path
+					} else {
+						r.def.MovedTo = f.Path
+					}
+				}
+			}
+		}
+	}
+}
+
+// SharedDefs counts definitions two files have in common (by kind and
+// name), to pair a deleted file with a new one git didn't see as a rename.
+func SharedDefs(a, b *File) int {
+	names := map[string]int{}
+	for _, d := range a.Defs {
+		names[d.Kind+"\x00"+d.Name]++
+	}
+	n := 0
+	for _, d := range b.Defs {
+		if names[d.Kind+"\x00"+d.Name] > 0 {
+			names[d.Kind+"\x00"+d.Name]--
+			n++
+		}
+	}
+	return n
 }
 
 // owners maps each line (1-based) to the innermost symbol containing it, -1 if none.
@@ -168,11 +280,14 @@ func (a *File) compare(oldSyms, newSyms []outline.Symbol, oldLines, newLines []s
 	oldOwn, newOwn := owners(oldSyms, len(oldLines)), owners(newSyms, len(newLines))
 	minus := make([]int, len(oldSyms))
 	plus := make([]int, len(newSyms))
+	real := make([]bool, len(newSyms)) // a non-blank line changed in its own lines
+	realOld := make([]bool, len(oldSyms))
 	var top []string
 	for _, h := range a.Hunks {
 		for k, l := range h.Removed {
 			if o := at(oldOwn, h.OldStart+k); o >= 0 {
 				minus[o]++
+				realOld[o] = realOld[o] || strings.TrimSpace(l) != ""
 			} else {
 				a.TopMinus++
 				top = append(top, "-"+l)
@@ -181,6 +296,7 @@ func (a *File) compare(oldSyms, newSyms []outline.Symbol, oldLines, newLines []s
 		for k, l := range h.Added {
 			if o := at(newOwn, h.NewStart+k); o >= 0 {
 				plus[o]++
+				real[o] = real[o] || strings.TrimSpace(l) != ""
 			} else {
 				a.TopPlus++
 				top = append(top, "+"+l)
@@ -217,16 +333,19 @@ func (a *File) compare(oldSyms, newSyms []outline.Symbol, oldLines, newLines []s
 		}
 		os, ns := oldSyms[o], newSyms[j]
 		sigChanged := norm(os.Sig) != norm(ns.Sig)
-		if plus[j] == 0 && minus[o] == 0 && !sigChanged {
-			continue
+		if !real[j] && !realOld[o] && !sigChanged {
+			continue // nothing, or only blank lines
 		}
 		c := Change{What: "changed", Kind: ns.Kind, Name: outline.Qualified(newSyms, j), Line: ns.Line, End: ns.End,
 			OldLine: os.Line, OldEnd: os.End, Plus: plus[j], Minus: minus[o]}
 		if sigChanged {
 			c.OldSig, c.NewSig = os.Sig, ns.Sig
 		}
-		if !sigChanged && equal(text(oldLines, os), text(newLines, ns)) {
+		switch ot, nt := text(oldLines, os), text(newLines, ns); {
+		case !sigChanged && equal(ot, nt):
 			c.What = "moved" // removed and added again elsewhere, unchanged
+		case equal(squeeze(ot), squeeze(nt)):
+			c.Note = "whitespace only"
 		}
 		a.Changes = append(a.Changes, c)
 	}
@@ -277,8 +396,26 @@ func (a *File) compare(oldSyms, newSyms []outline.Symbol, oldLines, newLines []s
 			continue
 		}
 		s := newSyms[j]
-		a.Changes = append(a.Changes, Change{What: "added", Kind: s.Kind, Name: outline.Qualified(newSyms, j), Line: s.Line, End: s.End,
-			Members: members(newSyms, j)})
+		c := Change{What: "added", Kind: s.Kind, Name: outline.Qualified(newSyms, j), Line: s.Line, End: s.End,
+			Members: members(newSyms, j)}
+		// a new function whose body is mostly an old one's: code was extracted or copied
+		nb := body(text(newLines, s))
+		if len(nb) >= 3 {
+			best, bestScore := -1, 0.0
+			for i := range oldSyms {
+				if oldSyms[i].Kind != s.Kind || outline.Qualified(oldSyms, i) == c.Name {
+					continue
+				}
+				if sc := similarity(body(text(oldLines, oldSyms[i])), nb); sc > bestScore {
+					best, bestScore = i, sc
+				}
+			}
+			if best >= 0 && bestScore >= 0.6 {
+				c.From = outline.Qualified(oldSyms, best)
+				c.Differs = differing(body(text(oldLines, oldSyms[best])), nb)
+			}
+		}
+		a.Changes = append(a.Changes, c)
 	}
 	for _, i := range keptRemoved {
 		s := oldSyms[i]
@@ -354,6 +491,39 @@ func all(ls []string, f func(string) bool) bool {
 }
 
 func norm(s string) string { return strings.Join(strings.Fields(s), " ") }
+
+// squeeze drops all whitespace, to tell whitespace-only changes apart.
+func squeeze(ls []string) []string {
+	out := make([]string, 0, len(ls))
+	for _, l := range ls {
+		if t := strings.Join(strings.Fields(l), ""); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// differing counts the lines that differ between a and b; a line that was
+// edited counts once.
+func differing(a, b []string) int {
+	count := map[string]int{}
+	for _, l := range a {
+		count[l]++
+	}
+	onlyB := 0
+	for _, l := range b {
+		if count[l] > 0 {
+			count[l]--
+		} else {
+			onlyB++
+		}
+	}
+	onlyA := 0
+	for _, c := range count {
+		onlyA += c
+	}
+	return max(onlyA, onlyB)
+}
 
 func equal(a, b []string) bool {
 	if len(a) != len(b) {

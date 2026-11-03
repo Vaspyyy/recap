@@ -455,3 +455,44 @@ func FullDiff(c *Comparison, context int, color bool, paths []string) ([]byte, e
 	}
 	return Run(append(append(args, c.DiffArgs...), pathArgs(paths)...)...)
 }
+
+// Conflicts lists the paths with unresolved merge conflicts.
+func Conflicts(paths []string) map[string]bool {
+	out, err := Run(append([]string{"ls-files", "-u", "-z", "--full-name"}, pathArgs(paths)...)...)
+	if err != nil {
+		return nil
+	}
+	set := map[string]bool{}
+	for _, rec := range strings.Split(string(out), "\x00") {
+		if _, p, ok := strings.Cut(rec, "\t"); ok {
+			set[p] = true
+		}
+	}
+	return set
+}
+
+// DiffContents is git's -U0 diff of two contents (for files git didn't pair).
+func DiffContents(old, new []byte) (hunks []Hunk, added, deleted int, err error) {
+	dir, err := os.MkdirTemp("", "recap-")
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	defer os.RemoveAll(dir)
+	a, b := filepath.Join(dir, "a"), filepath.Join(dir, "b")
+	if err := os.WriteFile(a, old, 0o600); err != nil {
+		return nil, 0, 0, err
+	}
+	if err := os.WriteFile(b, new, 0o600); err != nil {
+		return nil, 0, 0, err
+	}
+	// --no-index exits 1 when the files differ; that's not a failure here
+	cmd := command("diff", "--no-index", "--no-ext-diff", "--no-color", "-U0", a, b)
+	patch, _ := cmd.Output()
+	f := []*File{{}}
+	attachHunks(f, patch)
+	for _, h := range f[0].Hunks {
+		added += len(h.Added)
+		deleted += len(h.Removed)
+	}
+	return f[0].Hunks, added, deleted, nil
+}

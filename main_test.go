@@ -202,3 +202,93 @@ func TestBinaryFiles(t *testing.T) {
 		t.Errorf("got:\n%s", out)
 	}
 }
+
+// Found while building the lab: moves and extractions must not look like new code.
+func TestMovesAndExtractions(t *testing.T) {
+	write, commit := repo(t)
+	write("sort.go", `
+package fsx
+
+func Compare(a, b string) int {
+	la := fold(a)
+	lb := fold(b)
+	if la < lb {
+		return -1
+	}
+	return 1
+}
+`)
+	write("cart.py", "class Cart:\n    pass\n\n\ndef apply_coupon(cart, code):\n    total = cart.total()\n    if code:\n        total *= 0.9\n    return total\n")
+	write("api.ts", "export function fetchUser(id: number) {\n  return id;\n}\n\nexport function fetchTeam(id: number) {\n  return id;\n}\n\nexport class Client {\n  get() {}\n}\n")
+	commit("first")
+	// an extracted helper with one line changed (a planted bug)
+	write("sort.go", `
+package fsx
+
+func Compare(a, b string) int {
+	return compare(a, b)
+}
+
+func compare(a, b string) int {
+	la := fold(a)
+	lb := b
+	if la < lb {
+		return -1
+	}
+	return 1
+}
+`)
+	// a function moved to another file
+	write("cart.py", "class Cart:\n    pass\n")
+	write("discounts.py", "def apply_coupon(cart, code):\n    total = cart.total()\n    if code:\n        total *= 0.9\n    return total\n")
+	// a file moved and edited too much for git to call it a rename
+	os.MkdirAll("net", 0o755)
+	os.Remove("api.ts")
+	write("net/client.ts", "export function fetchUser(id: number, signal?: AbortSignal) {\n  return id + 0;\n}\n\nexport function fetchTeam(id: number) {\n  return id * 1;\n}\n\nexport class Client {\n  get() { return 1; }\n}\n")
+	out, _ := recap(t)
+	for _, want := range []string{
+		"added    func compare  L7-14  (body taken from Compare, 1 line differs)",
+		"removed  def apply_coupon  was L5-9  (moved to discounts.py)",
+		"discounts.py  untracked, 5 lines: def apply_coupon (from cart.py)",
+		"net/client.ts  moved from api.ts (git saw a delete and a new file; paired by their definitions), +4 −4",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in\n%s", want, out)
+		}
+	}
+	// committed, the moved file is paired with the deleted one
+	commit("refactor")
+	out, _ = recap(t, "HEAD~1", "HEAD")
+	if !strings.Contains(out, "net/client.ts  moved from api.ts (git saw a delete and a new file; paired by their definitions)") ||
+		strings.Contains(out, "api.ts  deleted") {
+		t.Errorf("moved file not paired:\n%s", out)
+	}
+	if !strings.Contains(out, "was: export function fetchUser(id: number)") {
+		t.Errorf("signature change inside the moved file missing:\n%s", out)
+	}
+}
+
+func TestConflictsWhitespaceAndCounts(t *testing.T) {
+	write, commit := repo(t)
+	write("m.go", "package m\n\nfunc Tidy() int {\n\treturn 1\n}\n\nfunc Other() int {\n\treturn 1\n}\n")
+	commit("first")
+	write("m.go", "package m\n\nfunc Tidy() int {\n    return 1\n}\n\nfunc Other() int {\n\treturn 1\n}\n")
+	write("scratch.txt", "a\nb\nc\nd\n")
+	out, _ := recap(t)
+	if !strings.Contains(out, "changed  func Tidy  L3-5  +1 −1  (whitespace only)") {
+		t.Errorf("whitespace-only change:\n%s", out)
+	}
+	if !strings.Contains(out, "1 file changed, +1 −1, 1 untracked") {
+		t.Errorf("untracked lines must not count in the totals:\n%s", out)
+	}
+	commit("spaces")
+	exec.Command("git", "checkout", "-q", "-b", "other", "HEAD~1").Run()
+	write("m.go", "package m\n\nfunc Tidy() int {\n\treturn 2\n}\n")
+	commit("two")
+	exec.Command("git", "checkout", "-q", "main").Run()
+	exec.Command("git", "-c", "user.name=A", "-c", "user.email=a@b", "merge", "-q", "other").Run()
+	out, _ = recap(t)
+	if !strings.Contains(out, "m.go  merge conflict (unresolved)") || !strings.Contains(out, "1 file with merge conflicts") {
+		t.Errorf("conflict not flagged:\n%s", out)
+	}
+}

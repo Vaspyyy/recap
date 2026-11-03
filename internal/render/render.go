@@ -43,17 +43,24 @@ func Counts(plus, minus int, c pal) string {
 // Summary is the totals line: "3 files changed, +120 −45".
 func Summary(files []*analyze.File, color bool) string {
 	c := palette(color)
-	plus, minus, untracked := 0, 0, 0
+	plus, minus, untracked, conflicts := 0, 0, 0, 0
 	for _, f := range files {
-		plus += f.Added
-		minus += f.Deleted
 		if f.Untracked {
 			untracked++
+			continue // their lines aren't part of the diff
+		}
+		plus += f.Added
+		minus += f.Deleted
+		if f.Conflict {
+			conflicts++
 		}
 	}
 	s := plural(len(files)-untracked, "file") + " changed, " + Counts(plus, minus, c)
 	if untracked > 0 {
 		s += fmt.Sprintf(", %d untracked", untracked)
+	}
+	if conflicts > 0 {
+		s += c.red + fmt.Sprintf(", %s with merge conflicts", plural(conflicts, "file")) + c.reset
 	}
 	return s
 }
@@ -138,6 +145,7 @@ func compactLine(f *analyze.File, c pal) string {
 	var groups []string
 	for _, what := range []string{"changed", "renamed", "moved", "added", "removed"} {
 		var names []string
+		seen := map[string]bool{}
 		for _, ch := range f.Changes {
 			if ch.What != what {
 				continue
@@ -152,6 +160,10 @@ func compactLine(f *analyze.File, c pal) string {
 			if ch.OldSig != "" && what == "changed" {
 				n += " (signature)"
 			}
+			if seen[n] { // a Rust struct and its impl block share a name
+				continue
+			}
+			seen[n] = true
 			names = append(names, n)
 		}
 		if len(names) > 6 {
@@ -161,8 +173,7 @@ func compactLine(f *analyze.File, c pal) string {
 			groups = append(groups, what+" "+strings.Join(names, ", "))
 		}
 	}
-	if len(f.Symbols) > 0 {
-		syms := f.Symbols
+	if syms := f.Symbols(); len(syms) > 0 {
 		if len(syms) > 6 {
 			syms = append(syms[:6:6], fmt.Sprintf("+%d more", len(syms)-6))
 		}
@@ -189,8 +200,12 @@ func (w *writer) file(f *analyze.File, quota int, ind string) {
 	head := ind + c.bold + f.Path + c.reset
 	var status string
 	switch {
+	case f.Conflict:
+		status = c.red + "merge conflict (unresolved)" + c.reset
 	case f.Untracked:
 		status = c.green + "untracked" + c.reset
+	case f.Status == 'R' && f.Similarity < 0:
+		status = c.yellow + "moved from " + f.OldPath + " (git saw a delete and a new file; paired by their definitions)" + c.reset
 	case f.Status == 'A':
 		status = c.green + "new" + c.reset
 	case f.Status == 'D':
@@ -220,12 +235,14 @@ func (w *writer) file(f *analyze.File, quota int, ind string) {
 	if f.Generated != "" {
 		tail = append(tail, f.Generated)
 	}
+	if f.NewMode == "120000" || f.OldMode == "120000" {
+		tail = append(tail, "symlink")
+	}
 	if f.OldMode != "" && f.NewMode != "" && f.OldMode != f.NewMode && f.OldMode != "000000" && f.NewMode != "000000" && f.Status != 'T' {
 		tail = append(tail, "mode "+f.OldMode+" → "+f.NewMode)
 	}
 	line := head + "  " + status + ", " + strings.Join(tail, ", ")
-	if len(f.Symbols) > 0 {
-		syms := f.Symbols
+	if syms := f.Symbols(); len(syms) > 0 {
 		extra := ""
 		if len(syms) > 8 {
 			syms, extra = syms[:8], fmt.Sprintf(" +%d more", len(syms)-8)
@@ -287,6 +304,23 @@ func (w *writer) change(ch analyze.Change, ind string) {
 	}
 	if ch.Members > 0 {
 		extra += c.faint + fmt.Sprintf("  (with %d inside)", ch.Members) + c.reset
+	}
+	switch {
+	case ch.FromFile != "":
+		extra += c.faint + "  (moved from " + ch.FromFile + ")" + c.reset
+	case ch.What == "added" && ch.From != "" && ch.Differs == 0:
+		extra += "  (body taken from " + ch.From + ", identical)"
+	case ch.What == "added" && ch.From == "" || ch.What != "added":
+	case ch.Differs == 1:
+		extra += "  " + c.yellow + "(body taken from " + ch.From + ", 1 line differs)" + c.reset
+	default:
+		extra += "  " + c.yellow + fmt.Sprintf("(body taken from %s, %d lines differ)", ch.From, ch.Differs) + c.reset
+	}
+	if ch.MovedTo != "" {
+		extra += c.faint + "  (moved to " + ch.MovedTo + ")" + c.reset
+	}
+	if ch.Note != "" {
+		extra += c.faint + "  (" + ch.Note + ")" + c.reset
 	}
 	w.line("%s  %s%-8s%s %s  %s%s%s%s", ind, color, ch.What, c.reset, c.bold+name+c.reset, c.cyan, where, c.reset, extra)
 	if ch.OldSig != "" {

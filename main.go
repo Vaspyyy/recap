@@ -236,6 +236,12 @@ func collect(top string, comp *gitx.Comparison, untracked bool) ([]*analyze.File
 		contents[f.Path] = pair{old, new}
 		files = append(files, analyze.Analyze(f, old, new, false))
 	}
+	if comp.New.Worktree || comp.New.Index {
+		conflicts := gitx.Conflicts(comp.Paths)
+		for _, f := range files {
+			f.Conflict = conflicts[f.Path]
+		}
+	}
 	if untracked {
 		paths, err := gitx.Untracked(comp.Paths)
 		if err != nil {
@@ -254,7 +260,64 @@ func collect(top string, comp *gitx.Comparison, untracked bool) ([]*analyze.File
 			files = append(files, analyze.Analyze(f, nil, data, true))
 		}
 	}
+	files = pairMoves(files, contents)
+	analyze.Link(files)
 	return files, contents, nil
+}
+
+// pairMoves finds deleted files that reappear as new files git didn't call
+// a rename (moved and edited too much), by the definitions they share, and
+// compares them as one file.
+func pairMoves(files []*analyze.File, contents map[string]pair) []*analyze.File {
+	used := map[*analyze.File]bool{}
+	for _, d := range files {
+		if d.Status != 'D' || len(d.Defs) < 2 {
+			continue
+		}
+		var best *analyze.File
+		bestN := 0
+		for _, a := range files {
+			if used[a] || !(a.Status == 'A' || a.Untracked) || len(a.Defs) < 2 || ext(a.Path) != ext(d.Path) {
+				continue
+			}
+			if n := analyze.SharedDefs(d, a); n > bestN {
+				best, bestN = a, n
+			}
+		}
+		if best == nil || bestN*2 < min(len(d.Defs), len(best.Defs)) {
+			continue
+		}
+		old, new := contents[d.Path].old, contents[best.Path].new
+		hunks, added, deleted, err := gitx.DiffContents(old, new)
+		if err != nil {
+			continue
+		}
+		f := &gitx.File{Status: 'R', OldPath: d.Path, Path: best.Path, Similarity: -1, Added: added, Deleted: deleted, Hunks: hunks,
+			OldMode: d.OldMode, NewMode: best.NewMode}
+		merged := analyze.Analyze(f, old, new, false)
+		merged.Conflict = best.Conflict
+		used[d], used[best] = true, true
+		contents[best.Path] = pair{old, new}
+		for i, x := range files {
+			if x == best {
+				files[i] = merged
+			}
+		}
+	}
+	var out []*analyze.File
+	for _, f := range files {
+		if !(used[f] && f.Status == 'D') {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+func ext(p string) string {
+	if i := strings.LastIndexByte(p, '.'); i > strings.LastIndexByte(p, '/') {
+		return p[i:]
+	}
+	return ""
 }
 
 func runLog(out *bufio.Writer, o *opts, color bool) int {
