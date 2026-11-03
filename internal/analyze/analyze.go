@@ -38,6 +38,7 @@ type Change struct {
 	Note     string // "whitespace only", "rewritten"
 	Public   bool   // part of the public API (exported, pub, export, public)
 
+	Detail  []string // a small change's changed lines ("-  return x", "+  return x + 1")
 	OldText []string // its lines before (or of where it came from), for --show
 	NewText []string // its lines now (or where it went)
 }
@@ -67,6 +68,7 @@ type File struct {
 	TopPlus     int // changed lines outside any symbol
 	TopMinus    int
 	TopReal     bool // some of them aren't blank
+	TopBlank    int  // how many of them are blank
 	TopImports  bool // all of them are imports
 	TopLines    []string
 	Defs        []Def // new and deleted files: their definitions
@@ -94,7 +96,7 @@ func generated(p string, data []byte) string {
 		return "lock file"
 	case strings.Contains(p, "vendor/") || strings.Contains(p, "node_modules/") || strings.Contains(p, "third_party/"):
 		return "vendored"
-	case strings.Contains(p, ".min."):
+	case strings.Contains(p, ".min."), minified(p, data):
 		return "minified"
 	case generatedPathRe.MatchString(p):
 		return "generated"
@@ -144,6 +146,30 @@ func Analyze(f *gitx.File, old, new []byte, untracked bool) *File {
 }
 
 // lineEndings reports a change of line endings and nothing else.
+// minified: JavaScript or CSS on a few very long lines.
+func minified(p string, data []byte) bool {
+	switch strings.ToLower(path.Ext(p)) {
+	case ".js", ".mjs", ".cjs", ".css":
+	default:
+		return false
+	}
+	longest, start := 0, 0
+	for i, b := range data {
+		if b == '\n' {
+			longest = max(longest, i-start)
+			start = i + 1
+		}
+	}
+	longest = max(longest, len(data)-start)
+	return longest > 1000
+}
+
+func lastPart(name string) string { return name[strings.LastIndexByte(name, '.')+1:] }
+
+func sigOf(text []string) string {
+	return fullSig(text, outline.Symbol{Line: 1, End: len(text)})
+}
+
 func lineEndings(hunks []gitx.Hunk) string {
 	if len(hunks) == 0 {
 		return ""
@@ -201,7 +227,7 @@ func defs(p string, syms []outline.Symbol, lines []string) []Def {
 	var out []Def
 	for i, s := range syms {
 		top := s.Parent < 0 || (s.Kind == "h2" && syms[s.Parent].Kind == "h1")
-		out = append(out, Def{Kind: s.Kind, Name: outline.Qualified(syms, i), Line: s.Line, End: s.End, Sig: s.Sig, Top: top,
+		out = append(out, Def{Kind: s.Kind, Name: outline.Qualified(syms, i), Line: s.Line, End: s.End, Sig: fullSig(lines, s), Top: top,
 			Public: public(p, syms, i), Text: text(lines, s)})
 	}
 	return out
@@ -359,6 +385,10 @@ func (a *File) compare(oldSyms, newSyms []outline.Symbol, oldLines, newLines []s
 	a.setTop(top)
 
 	// pair symbols by kind and qualified name, in order of appearance
+	// pair symbols by kind and qualified name; among same-named ones
+	// (overloads, several impl blocks) identical signatures first, then in order
+	oldSig := func(i int) string { return norm(fullSig(oldLines, oldSyms[i])) }
+	newSig := func(j int) string { return norm(fullSig(newLines, newSyms[j])) }
 	byKey := map[string][]int{}
 	for i := range oldSyms {
 		byKey[key(oldSyms, i)] = append(byKey[key(oldSyms, i)], i)
@@ -368,13 +398,52 @@ func (a *File) compare(oldSyms, newSyms []outline.Symbol, oldLines, newLines []s
 	for i := range oldMatch {
 		oldMatch[i] = -1
 	}
-	for j := range newSyms {
+	for j := range newMatch {
 		newMatch[j] = -1
-		k := key(newSyms, j)
-		if list := byKey[k]; len(list) > 0 {
-			newMatch[j], oldMatch[list[0]] = list[0], j
-			byKey[k] = list[1:]
+	}
+	dup := map[string]bool{} // names that occur more than once on either side
+	seenOld, seenNew := map[string]int{}, map[string]int{}
+	for i := range oldSyms {
+		if seenOld[key(oldSyms, i)]++; seenOld[key(oldSyms, i)] > 1 {
+			dup[key(oldSyms, i)] = true
 		}
+	}
+	for j := range newSyms {
+		if seenNew[key(newSyms, j)]++; seenNew[key(newSyms, j)] > 1 {
+			dup[key(newSyms, j)] = true
+		}
+	}
+	for pass := 0; pass < 2; pass++ {
+		for j := range newSyms {
+			if newMatch[j] >= 0 {
+				continue
+			}
+			k := key(newSyms, j)
+			for n, i := range byKey[k] {
+				if pass == 0 && (!dup[k] || oldSig(i) != newSig(j)) {
+					continue
+				}
+				newMatch[j], oldMatch[i] = i, j
+				byKey[k] = append(byKey[k][:n:n], byKey[k][n+1:]...)
+				break
+			}
+		}
+	}
+	// a symbol "moved" only if its order among the others changed, not
+	// because lines were inserted above it
+	before := func(match []int, syms, other []outline.Symbol, i int) (inOwn, inOther int) {
+		for k, m := range match {
+			if m < 0 || k == i {
+				continue
+			}
+			if syms[k].Line < syms[i].Line {
+				inOwn++
+			}
+			if other[m].Line < other[match[i]].Line {
+				inOther++
+			}
+		}
+		return
 	}
 
 	for j, o := range newMatch {
@@ -382,30 +451,50 @@ func (a *File) compare(oldSyms, newSyms []outline.Symbol, oldLines, newLines []s
 			continue
 		}
 		os, ns := oldSyms[o], newSyms[j]
-		sigChanged := norm(os.Sig) != norm(ns.Sig)
+		osig, nsig := fullSig(oldLines, os), fullSig(newLines, ns)
+		sigChanged := norm(osig) != norm(nsig)
 		if !real[j] && !realOld[o] && !sigChanged {
 			continue // nothing, or only blank lines
 		}
 		ot, nt := text(oldLines, os), text(newLines, ns)
+		oa, _ := attribution(oldLines, os)
+		na, _ := attribution(newLines, ns)
+		oat, nat := oldLines[oa-1:min(len(oldLines), os.End)], newLines[na-1:min(len(newLines), ns.End)]
 		c := Change{What: "changed", Kind: ns.Kind, Name: outline.Qualified(newSyms, j), Line: ns.Line, End: ns.End,
 			OldLine: os.Line, OldEnd: os.End, Plus: plus[j], Minus: minus[o], OldText: ot, NewText: nt,
 			Public: public(a.Path, newSyms, j) || public(a.oldPath(), oldSyms, o)}
 		if !hasChildren(newSyms, j) && !hasChildren(oldSyms, o) {
-			// a leaf: count its own diff (with its doc comment) rather than git's hunk alignment
-			oa, _ := attribution(oldLines, os)
-			na, _ := attribution(newLines, ns)
-			if ops := LineDiff(oldLines[oa-1:min(len(oldLines), os.End)], newLines[na-1:min(len(newLines), ns.End)]); ops != nil {
-				c.Plus, c.Minus = Counts(ops)
+			// a leaf: its own diff explains the change better than git's hunk
+			// alignment, unless code moved out of it (then git's is smaller)
+			if ops := LineDiff(oat, nat); ops != nil {
+				if p, m := Counts(ops); p+m <= c.Plus+c.Minus || c.Plus+c.Minus == 0 {
+					c.Plus, c.Minus = p, m
+				}
+				c.Detail = detail(ops, sigChanged)
 			}
 		}
 		if sigChanged {
-			c.OldSig, c.NewSig = os.Sig, ns.Sig
+			c.OldSig, c.NewSig = osig, nsig
+			// lines of a multi-line signature are already in was/now
+			var keep []string
+			for _, l := range c.Detail {
+				if t := strings.TrimSpace(l[1:]); !strings.Contains(osig, t) && !strings.Contains(nsig, strings.TrimSuffix(t, ",")) {
+					keep = append(keep, l)
+				}
+			}
+			c.Detail = keep
 		}
 		switch {
+		case !sigChanged && equal(ot, nt) && !equal(oat, nat):
+			c.Note = "doc comment only"
 		case !sigChanged && equal(ot, nt):
-			c.What, c.Plus, c.Minus = "moved", 0, 0 // removed and added again elsewhere, unchanged
+			ob, nb := before(newMatch, newSyms, oldSyms, j)
+			if ob == nb {
+				continue // only shifted by lines inserted or removed above it
+			}
+			c.What, c.Plus, c.Minus, c.Detail = "moved", 0, 0, nil // reordered, unchanged
 		case equal(squeeze(ot), squeeze(nt)):
-			c.Note = "whitespace only"
+			c.Note, c.Detail = "whitespace only", nil
 		}
 		a.Changes = append(a.Changes, c)
 	}
@@ -460,8 +549,8 @@ func (a *File) compare(oldSyms, newSyms []outline.Symbol, oldLines, newLines []s
 		if ops := LineDiff(renamed(ot, os.Name, ns.Name), nt); ops != nil {
 			c.Plus, c.Minus = Counts(ops)
 		}
-		if norm(strings.Replace(os.Sig, os.Name, ns.Name, 1)) != norm(ns.Sig) {
-			c.OldSig, c.NewSig = os.Sig, ns.Sig
+		if osig, nsig := fullSig(oldLines, os), fullSig(newLines, ns); norm(strings.Replace(osig, lastPart(os.Name), lastPart(ns.Name), 1)) != norm(nsig) {
+			c.OldSig, c.NewSig = osig, nsig
 		}
 		a.Changes = append(a.Changes, c)
 	}
@@ -473,6 +562,9 @@ func (a *File) compare(oldSyms, newSyms []outline.Symbol, oldLines, newLines []s
 		nt := text(newLines, s)
 		c := Change{What: "added", Kind: s.Kind, Name: outline.Qualified(newSyms, j), Line: s.Line, End: s.End,
 			Members: members(newSyms, j), NewText: nt, Public: public(a.Path, newSyms, j)}
+		if s.Parent >= 0 && newSyms[s.Parent].Kind == "trait" && len(nt) == 1 && strings.HasSuffix(strings.TrimSpace(nt[0]), ";") {
+			c.Note = "required: every implementation must add it"
+		}
 		// a new function whose body is mostly an old one's: code was extracted or copied
 		if nb := body(nt); len(nb) >= 3 {
 			best, bestScore := -1, 0.0
@@ -489,6 +581,9 @@ func (a *File) compare(oldSyms, newSyms []outline.Symbol, oldLines, newLines []s
 				c.OldText = text(oldLines, oldSyms[best])
 				c.OldLine, c.OldEnd = oldSyms[best].Line, oldSyms[best].End
 				c.Differs = differing(body(c.OldText), nb)
+				if ops := LineDiff(c.OldText[min(1, len(c.OldText)):], nt[min(1, len(nt)):]); ops != nil {
+					c.Detail = detail(ops, true)
+				}
 			}
 		}
 		a.Changes = append(a.Changes, c)
@@ -506,6 +601,76 @@ func (a *File) compare(oldSyms, newSyms []outline.Symbol, oldLines, newLines []s
 		}
 		return cx.Line < cy.Line
 	})
+}
+
+// maxDetail is the most changed lines shown inline for a small change.
+const maxDetail = 4
+
+// detail returns a small diff's changed lines (without the signature line,
+// which is shown on its own), or nil if there are too many.
+func detail(ops []Op, skipSig bool) []string {
+	var out []string
+	for i, o := range ops {
+		if o.Kind == ' ' || skipSig && i == 0 || strings.TrimSpace(o.Text) == "" {
+			continue
+		}
+		out = append(out, string(o.Kind)+o.Text)
+	}
+	if skipSig && len(ops) > 0 && ops[0].Kind != ' ' {
+		// the first line changed: it's part of the signature lines
+		out = dropSigLines(ops, out)
+	}
+	if len(out) == 0 || len(out) > maxDetail {
+		return nil
+	}
+	return out
+}
+
+// dropSigLines removes the changed lines of a signature that spans the
+// first lines of a symbol (shown as was/now instead).
+func dropSigLines(ops []Op, out []string) []string {
+	sig := map[string]bool{}
+	for _, o := range ops {
+		if o.Kind == ' ' {
+			break
+		}
+		sig[string(o.Kind)+o.Text] = true
+	}
+	var keep []string
+	for _, l := range out {
+		if !sig[l] {
+			keep = append(keep, l)
+		}
+	}
+	return keep
+}
+
+// fullSig is a symbol's signature, also when it spans several lines: from
+// its first line up to the one that opens its body.
+func fullSig(lines []string, s outline.Symbol) string {
+	var parts []string
+	for n := s.Line; n <= min(s.End, s.Line+7, len(lines)); n++ {
+		l := strings.TrimSpace(lines[n-1])
+		parts = append(parts, l)
+		if strings.HasSuffix(l, "{") || strings.HasSuffix(l, ":") || strings.HasSuffix(l, ";") ||
+			strings.HasSuffix(l, "=>") || strings.Contains(l, "{") || n == s.Line && balanced(l) {
+			break
+		}
+	}
+	sig := strings.Join(parts, " ")
+	if i := strings.IndexByte(sig, '{'); i > 0 {
+		sig = strings.TrimSpace(sig[:i])
+	}
+	sig = strings.ReplaceAll(strings.ReplaceAll(sig, "( ", "("), ", )", ")")
+	if r := []rune(sig); len(r) > 200 {
+		sig = string(r[:199]) + "…"
+	}
+	return sig
+}
+
+// balanced: the line opens as many parentheses as it closes.
+func balanced(l string) bool {
+	return strings.Count(l, "(") == strings.Count(l, ")")
 }
 
 func (a *File) oldPath() string {
@@ -606,7 +771,7 @@ func Link(files []*File) {
 	}
 	source := func(r *ref) (text []string, sig string, line, end int) {
 		if r.ch != nil {
-			return r.ch.OldText, firstLine(r.ch.OldText), r.ch.OldLine, r.ch.OldEnd
+			return r.ch.OldText, sigOf(r.ch.OldText), r.ch.OldLine, r.ch.OldEnd
 		}
 		return r.def.Text, r.def.Sig, r.def.Line, r.def.End
 	}
@@ -623,8 +788,8 @@ func Link(files []*File) {
 			ot, osig, ol, oe := source(r)
 			ch.FromFile, ch.OldText, ch.OldLine, ch.OldEnd = r.f.Path, ot, ol, oe
 			ch.Differs = differing(ot, ch.NewText)
-			if norm(osig) != norm(firstLine(ch.NewText)) {
-				ch.OldSig, ch.NewSig = strings.TrimSpace(osig), strings.TrimSpace(firstLine(ch.NewText))
+			if nsig := sigOf(ch.NewText); norm(osig) != norm(nsig) {
+				ch.OldSig, ch.NewSig = osig, nsig
 			}
 			mark(r, f.Path, ch.NewText, ch.Differs)
 		}
@@ -645,13 +810,6 @@ func Link(files []*File) {
 			}
 		}
 	}
-}
-
-func firstLine(ls []string) string {
-	if len(ls) == 0 {
-		return ""
-	}
-	return ls[0]
 }
 
 // SharedDefs counts definitions two files have in common (by kind and
@@ -710,6 +868,7 @@ func (a *File) setTop(top []string) {
 			keep = append(keep, l)
 		}
 	}
+	a.TopBlank = len(top) - len(keep)
 	a.TopReal = len(keep) > 0
 	a.TopImports = a.TopReal && all(keep, func(l string) bool { return importRe.MatchString(l[1:]) })
 	if len(keep) <= 2 {

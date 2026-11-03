@@ -146,8 +146,23 @@ func Files(files []*analyze.File, o Options) string {
 			}
 		}
 	}
+	// what's left goes to the changed lines of small changes, most important first
+	details := map[string]bool{}
+	for rank := 0; rank <= 5 && room > 0; rank++ {
+		for i := range ordered {
+			if quota[i] < need[i] {
+				continue // this file's list is already cut: no room for details
+			}
+			for _, ch := range ordered[i] {
+				if importance(ch) == rank && len(ch.Detail) > 0 && len(ch.Detail) <= room {
+					details[detailKey(files[i], ch)] = true
+					room -= len(ch.Detail)
+				}
+			}
+		}
+	}
 	for i, f := range files[:shownFiles] {
-		w.file(f, ordered[i], quota[i], o.Indent)
+		w.file(f, ordered[i], quota[i], o.Indent, details)
 	}
 	if n := len(files) - shownFiles; n > 0 {
 		var names []string
@@ -236,7 +251,11 @@ func status(f *analyze.File, c pal, compact bool) string {
 	return s + ", " + strings.Join(tail, ", ")
 }
 
-func (w *writer) file(f *analyze.File, changes []analyze.Change, quota int, ind string) {
+func detailKey(f *analyze.File, ch analyze.Change) string {
+	return f.Path + "\x00" + ch.What + "\x00" + ch.Name
+}
+
+func (w *writer) file(f *analyze.File, changes []analyze.Change, quota int, ind string, details map[string]bool) {
 	c := w.c
 	line := ind + c.bold + Path(f.Path) + c.reset + "  " + status(f, c, false)
 	if syms := f.Symbols(); len(syms) > 0 {
@@ -256,7 +275,7 @@ func (w *writer) file(f *analyze.File, changes []analyze.Change, quota int, ind 
 		if used+changeLines(ch) > quota {
 			break
 		}
-		w.change(ch, ind)
+		w.change(ch, ind, details[detailKey(f, ch)])
 		used += changeLines(ch)
 		shown++
 	}
@@ -267,8 +286,11 @@ func (w *writer) file(f *analyze.File, changes []analyze.Change, quota int, ind 
 			what = "imports"
 		}
 		detail := ""
+		if f.TopBlank > 0 {
+			detail = c.faint + fmt.Sprintf(" (%d blank)", f.TopBlank) + c.reset
+		}
 		if len(f.TopLines) > 0 {
-			detail = ": " + c.faint + strings.Join(clipAll(f.TopLines, 80), "  ") + c.reset
+			detail += ": " + c.faint + strings.Join(clipAll(f.TopLines, 80), "  ") + c.reset
 		}
 		w.line("%s  %s%-8s%s %s  %s%s", ind, c.faint, "also", c.reset, what, Counts(f.TopPlus, f.TopMinus, c), detail)
 		topShown = true
@@ -306,7 +328,7 @@ func summarize(rest []analyze.Change) string {
 	return plural(len(rest), "more change") + ": " + strings.Join(parts, ", ")
 }
 
-func (w *writer) change(ch analyze.Change, ind string) {
+func (w *writer) change(ch analyze.Change, ind string, withDetail bool) {
 	c := w.c
 	color := map[string]string{"changed": c.yellow, "added": c.green, "removed": c.red, "renamed": c.blue, "moved": c.blue}[ch.What]
 	name := Label(ch.Kind, ch.Name)
@@ -322,7 +344,7 @@ func (w *writer) change(ch analyze.Change, ind string) {
 		extra = append(extra, Counts(ch.Plus, ch.Minus, c))
 	}
 	var notes []string
-	if ch.Public && (ch.What == "removed" || ch.What == "renamed" || ch.OldSig != "") {
+	if ch.Public && (ch.What == "removed" || ch.What == "renamed" || ch.What == "added" || ch.OldSig != "") {
 		notes = append(notes, "public")
 	}
 	if ch.Members > 0 {
@@ -359,6 +381,15 @@ func (w *writer) change(ch analyze.Change, ind string) {
 		w.line("%s           %swas: %s%s", ind, c.faint, Clip(ch.OldSig, 200), c.reset)
 		w.line("%s           %snow: %s%s", ind, c.faint, Clip(ch.NewSig, 200), c.reset)
 	}
+	if withDetail {
+		for _, l := range ch.Detail {
+			col := c.green
+			if l[0] == '-' {
+				col = c.red
+			}
+			w.line("%s           %s%s %s%s", ind, col, l[:1], Clip(strings.TrimSpace(l[1:]), 150), c.reset)
+		}
+	}
 }
 
 func analyzeLines(n int) string {
@@ -372,12 +403,23 @@ func analyzeLines(n int) string {
 func Compact(files []*analyze.File, o Options) string {
 	w := &writer{c: palette(o.Color)}
 	shown := min(len(files), max(o.Budget, 1))
-	for _, f := range files[:shown] {
-		w.line("%s", o.Indent+compactLine(f, w.c))
+	keep := map[*analyze.File]bool{}
+	ranked := append([]*analyze.File(nil), files...)
+	sort.SliceStable(ranked, func(i, j int) bool { return Rank(ranked[i]) < Rank(ranked[j]) })
+	for _, f := range ranked[:shown] {
+		keep[f] = true
 	}
-	if n := len(files) - shown; n > 0 {
+	var hidden []*analyze.File
+	for _, f := range files {
+		if keep[f] {
+			w.line("%s", o.Indent+compactLine(f, w.c))
+		} else {
+			hidden = append(hidden, f)
+		}
+	}
+	if n := len(hidden); n > 0 {
 		var names []string
-		for _, f := range files[shown:min(len(files), shown+6)] {
+		for _, f := range hidden[:min(len(hidden), 6)] {
 			names = append(names, Path(f.Path))
 		}
 		w.line("%s%s… and %s: %s (raise -b)%s", o.Indent, w.c.faint, plural(n, "more file"), strings.Join(names, ", "), w.c.reset)
@@ -447,6 +489,28 @@ func compactLine(f *analyze.File, c pal) string {
 		b.WriteString(": " + strings.Join(groups, "; "))
 	}
 	return b.String()
+}
+
+// Rank orders files by how much a reader needs them when not all fit:
+// source with symbol changes, other source, tests, docs, data and fixtures,
+// then lock, generated and binary files.
+func Rank(f *analyze.File) int {
+	p := strings.ToLower(f.Path)
+	switch {
+	case f.Binary || f.Generated != "" || f.Submodule:
+		return 6
+	case strings.Contains(p, "testdata/") || strings.Contains(p, "fixtures/") || strings.Contains(p, "snapshots/"):
+		return 5
+	case strings.HasSuffix(p, ".md") || strings.HasSuffix(p, ".txt") || strings.HasSuffix(p, ".rst"):
+		return 3
+	case strings.Contains(p, "test"):
+		return 2
+	case f.Outlined && (len(f.Changes) > 0 || len(f.Defs) > 0):
+		return 0
+	case f.Outlined:
+		return 1
+	}
+	return 4
 }
 
 // Label is how a symbol is named in the report: "fn readback", "## Install".

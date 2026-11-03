@@ -108,8 +108,8 @@ func Compare(revs, paths []string, staged bool) (*Comparison, error) {
 	c := &Comparison{Paths: paths}
 	worktree := Side{Label: "working tree", Worktree: true}
 	switch {
-	case staged && len(revs) > 1:
-		return nil, errors.New("--staged compares the index with one revision (HEAD by default)")
+	case staged && (len(revs) > 1 || len(revs) == 1 && strings.Contains(revs[0], "..")):
+		return nil, errors.New("--staged compares the index with one commit (HEAD by default), not with a range")
 	case staged:
 		c.Old = headOrEmpty()
 		if len(revs) == 1 {
@@ -426,13 +426,13 @@ func Content(b *Blobs, top string, s Side, path string) ([]byte, error) {
 
 // Commit is one entry of git log.
 type Commit struct {
-	ID, Short, Author, Age, Subject string
-	Parents                         []string
+	ID, Short, Author, Age, Date, Subject, Body string
+	Parents                                     []string
 }
 
 // Log lists commits like git log (newest first).
 func Log(n int, revs, paths []string) ([]Commit, error) {
-	args := []string{"log", "--no-color", "-z", "--format=%H%x1f%h%x1f%an%x1f%ar%x1f%P%x1f%s"}
+	args := []string{"log", "--no-color", "-z", "--date=format:%Y-%m-%d %H:%M", "--format=%H%x1f%h%x1f%an%x1f%ar%x1f%P%x1f%ad%x1f%s%x1f%b"}
 	if n > 0 {
 		args = append(args, "-n", strconv.Itoa(n))
 	}
@@ -444,10 +444,11 @@ func Log(n int, revs, paths []string) ([]Commit, error) {
 	var commits []Commit
 	for _, rec := range strings.Split(string(out), "\x00") {
 		f := strings.Split(strings.TrimPrefix(rec, "\n"), "\x1f")
-		if len(f) < 6 {
+		if len(f) < 8 {
 			continue
 		}
-		commits = append(commits, Commit{ID: f[0], Short: f[1], Author: f[2], Age: f[3], Parents: strings.Fields(f[4]), Subject: f[5]})
+		commits = append(commits, Commit{ID: f[0], Short: f[1], Author: f[2], Age: f[3], Parents: strings.Fields(f[4]),
+			Date: f[5], Subject: f[6], Body: strings.TrimSpace(f[7])})
 	}
 	return commits, nil
 }

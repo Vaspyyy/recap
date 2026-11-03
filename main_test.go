@@ -131,7 +131,7 @@ func TestOverview(t *testing.T) {
 		"renamed  func Upload → UploadScene",
 		"added    func Upscale",
 		"removed  func Dispatch  was L17-19",
-		"imports  +2 −0: +import \"fmt\"",
+		"imports  +2 −0 (1 blank): +import \"fmt\"",
 		"changed  ## Install",
 		"notes.txt  untracked, 1 line",
 	} {
@@ -333,7 +333,7 @@ func TestFirstRoundRegressions(t *testing.T) {
 		t.Errorf("--show Circle.area bleeds or misses:\n%s", out)
 	}
 	out, _ = recap(t, "--show", "apply_coupon")
-	if !strings.Contains(out, "2 matches") || !strings.Contains(out, "-def apply_coupon(cart, code):") || !strings.Contains(out, "+def apply_coupon(cart, code, discounts):") {
+	if strings.Count(out, "apply_coupon  (") != 1 || !strings.Contains(out, "-def apply_coupon(cart, code):") || !strings.Contains(out, "+def apply_coupon(cart, code, discounts):") {
 		t.Errorf("--show of a moved function should diff both copies:\n%s", out)
 	}
 	// -n without log, log and show in an empty repository
@@ -395,5 +395,63 @@ func TestLineEndings(t *testing.T) {
 	write("eol.py", "def g():\r\n    return 2\r\n")
 	if out, _ = recap(t, "--show", "g"); !strings.Contains(out, "+    return 2␍") {
 		t.Errorf("--show should make the CR visible:\n%s", out)
+	}
+}
+
+// Regressions found by the second review round.
+func TestSecondRoundRegressions(t *testing.T) {
+	write, commit := repo(t)
+	write("lib.rs", "pub trait Shape {\n    fn area(&self) -> f64;\n}\n\npub fn total_area(v: &[f64]) -> f64 {\n    v.iter().sum()\n}\n\npub fn round_cents(x: f64) -> f64 {\n    (x * 100.0).round() / 100.0\n}\n")
+	write("a.ts", "function over(a: string): string;\nfunction over(a: any) {\n  return a;\n}\n\nexport default function main(\n  a: number,\n  b: string,\n): void {\n  console.log(a, b);\n}\n")
+	commit("first")
+	// a doc comment above total_area is not a move; a small body change shows its lines;
+	// a required trait method is flagged
+	write("lib.rs", "pub trait Shape {\n    fn area(&self) -> f64;\n    fn name(&self) -> String;\n}\n\n/// Sum of all areas.\npub fn total_area(v: &[f64]) -> f64 {\n    v.iter().sum()\n}\n\npub fn round_cents(x: f64) -> f64 {\n    (x * 100.0 + 1e-9).round() / 100.0\n}\n")
+	// a new overload before the implementation; a multi-line signature gains a parameter
+	write("a.ts", "function over(a: string): string;\nfunction over(a: boolean): boolean;\nfunction over(a: any) {\n  return a;\n}\n\nexport default function main(\n  a: number,\n  b: string,\n  c: boolean,\n): void {\n  console.log(a, b);\n}\n")
+	out, _ := recap(t)
+	for _, want := range []string{
+		"changed  fn total_area  L7-9  +1 −0  (doc comment only)",
+		"changed  fn round_cents  L11-13  +1 −1",
+		"- (x * 100.0).round() / 100.0",
+		"+ (x * 100.0 + 1e-9).round() / 100.0",
+		"added    fn Shape.name  L3  (public; required: every implementation must add it)",
+		"added    function over  L2",
+		"was: export default function main(a: number, b: string): void",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in\n%s", want, out)
+		}
+	}
+	for _, bad := range []string{"moved", "changed  function over"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("should not contain %q:\n%s", bad, out)
+		}
+	}
+	// --staged with a range, --show with an empty name, a miss on a clean tree
+	if _, code := recap(t, "--staged", "HEAD~1..HEAD"); code != 2 {
+		t.Errorf("--staged with a range should be an error")
+	}
+	if _, code := recap(t, "--show", ""); code != 2 {
+		t.Errorf("--show with an empty name should be an error")
+	}
+}
+
+// The extracted-helper case from the lab: the overview itself shows the
+// one line that differs, and the counts don't claim 50 removed lines.
+func TestExtractionShowsTheDifferingLine(t *testing.T) {
+	write, commit := repo(t)
+	body := "\tla := fold(a)\n\tlb := fold(b)\n\tif la < lb {\n\t\treturn -1\n\t}\n\tif la > lb {\n\t\treturn 1\n\t}\n\treturn 0\n"
+	write("s.go", "package s\n\nfunc Compare(a, b string) int {\n"+body+"}\n")
+	commit("first")
+	write("s.go", "package s\n\nfunc Compare(a, b string) int {\n\treturn compare(a, b)\n}\n\nfunc compare(a, b string) int {\n"+strings.Replace(body, "lb := fold(b)", "lb := b", 1)+"}\n")
+	out, _ := recap(t)
+	for _, want := range []string{"(body taken from Compare, 1 line differs)", "- lb := fold(b)", "+ lb := b"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "−9") || strings.Contains(out, "−10") {
+		t.Errorf("Compare's count should follow git's (+1 −…), not the moved body:\n%s", out)
 	}
 }

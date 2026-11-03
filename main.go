@@ -51,6 +51,7 @@ flags:
 type opts struct {
 	staged, patch, agent, noUntracked bool
 	show                              string
+	showSet                           bool
 	budget, n                         int
 	nSet                              bool
 	revs, paths                       []string
@@ -120,8 +121,9 @@ func parse(args []string) (*opts, int, string) {
 			o.noUntracked = true
 		case a == "--show":
 			o.show, msg = value(&i, "--show")
+			o.showSet = true
 		case strings.HasPrefix(a, "--show="):
-			o.show = strings.TrimPrefix(a, "--show=")
+			o.show, o.showSet = strings.TrimPrefix(a, "--show="), true
 		case a == "-b" || a == "--budget":
 			if v, msg = value(&i, a); msg == "" {
 				o.budget, msg = number(v, a)
@@ -154,6 +156,8 @@ func parse(args []string) (*opts, int, string) {
 		return nil, 2, "recap show takes one commit"
 	case o.sub == "show" && o.staged:
 		return nil, 2, "recap show is about a commit; --staged doesn't apply"
+	case o.showSet && strings.TrimSpace(o.show) == "":
+		return nil, 2, "--show needs a name: file:name, name, or a file"
 	}
 	return o, -1, ""
 }
@@ -204,12 +208,12 @@ func run(args []string) int {
 	if err != nil {
 		return fail(err.Error())
 	}
-	if o.show != "" {
-		return show(out, files, contents, o.show, color)
+	if o.showSet {
+		return show(out, comp, files, contents, o.show, color)
 	}
 
 	if commit != nil {
-		fmt.Fprintf(out, "%s  %s  %s\n", bold("commit "+commit.Short, color), commit.Author, commit.Age)
+		fmt.Fprintf(out, "%s  %s  %s\n", bold("commit "+commit.Short, color), commit.Author, commit.Date)
 		if msg, err := gitx.Message(commit.ID); err == nil {
 			for _, l := range strings.Split(msg, "\n") {
 				fmt.Fprintln(out, "    "+l)
@@ -221,6 +225,9 @@ func run(args []string) int {
 		fmt.Fprintln(out)
 	}
 	head := "recap: " + comp.Describe() + ": "
+	if len(o.paths) > 0 {
+		head = "recap: " + comp.Describe() + ", only " + strings.Join(o.paths, " ") + ": "
+	}
 	if len(files) == 0 {
 		fmt.Fprintln(out, head+"no changes")
 		return 0
@@ -395,7 +402,16 @@ func runLog(out *bufio.Writer, top string, o *opts, color bool) int {
 		if len(cm.Parents) > 1 {
 			merge = " (merge: compared with its first parent)"
 		}
-		fmt.Fprintf(out, "%s  %s  %s  %s%s\n", bold(cm.Short, color), cm.Age, cm.Author, cm.Subject, merge)
+		fmt.Fprintf(out, "%s  %s  %s  %s%s\n", bold(cm.Short, color), cm.Date, cm.Author, cm.Subject, merge)
+		if para, _, _ := strings.Cut(cm.Body, "\n\n"); para != "" { // the first paragraph says why
+			ls := strings.Split(para, "\n")
+			for k, l := range ls[:min(len(ls), 4)] {
+				if k == 3 && len(ls) > 4 {
+					l += " …"
+				}
+				fmt.Fprintln(out, "    "+l)
+			}
+		}
 		files, _, err := collect(top, gitx.CommitComparison(cm, o.paths), false)
 		if err != nil {
 			return fail(err.Error())
@@ -417,7 +433,7 @@ type target struct {
 }
 
 // show prints the diff of the changed symbols matching target, or of a file.
-func show(out *bufio.Writer, files []*analyze.File, contents map[string]pair, want string, color bool) int {
+func show(out *bufio.Writer, comp *gitx.Comparison, files []*analyze.File, contents map[string]pair, want string, color bool) int {
 	filePart, name, hasName := strings.Cut(want, ":")
 	if !hasName {
 		filePart, name = "", want
@@ -461,24 +477,32 @@ func show(out *bufio.Writer, files []*analyze.File, contents map[string]pair, wa
 			all = append(all, target{f, ch, d.Name})
 		}
 	}
-	// exact names first; otherwise the last part ("open" finds Repo.open)
+	// a name matches itself or a qualified name ending in it ("open" finds
+	// Repo.open and open alike); a class or type name finds its changed members
 	var hits []target
 	seen := map[string]bool{}
-	for _, exact := range []bool{true, false} {
+	add := func(match func(string) bool) {
 		for _, t := range all {
 			k := t.f.Path + "\x00" + t.ch.What + "\x00" + t.ch.Name
-			if seen[k] {
-				continue
-			}
-			if t.name == name || !exact && strings.HasSuffix(t.name, "."+name) {
+			if !seen[k] && match(t.name) {
 				hits = append(hits, t)
 				seen[k] = true
 			}
 		}
-		if len(hits) > 0 {
-			break
-		}
 	}
+	add(func(n string) bool { return n == name || strings.HasSuffix(n, "."+name) })
+	if len(hits) == 0 {
+		add(func(n string) bool { return strings.HasPrefix(n, name+".") })
+	}
+	// a move is one change: show it once, as the diff from the old copy
+	var dedup []target
+	for _, t := range hits {
+		if t.ch.What == "removed" && t.ch.MovedTo != "" && seen[t.ch.MovedTo+"\x00added\x00"+t.ch.Name] {
+			continue
+		}
+		dedup = append(dedup, t)
+	}
+	hits = dedup
 	switch {
 	case len(hits) == 0:
 		var names []string
@@ -488,7 +512,11 @@ func show(out *bufio.Writer, files []*analyze.File, contents map[string]pair, wa
 			}
 		}
 		if len(names) == 0 {
-			return fail("nothing changed matches " + strconv.Quote(want))
+			hint := ""
+			if comp.New.Worktree {
+				hint = " (--show looks at the working tree unless you give a commit or range: recap main...feature --show " + want + ")"
+			}
+			return fail("nothing changed matches " + strconv.Quote(want) + " in " + comp.Describe() + hint)
 		}
 		if len(names) > 12 {
 			names = append(names[:12], fmt.Sprintf("… +%d more", len(names)-12))
