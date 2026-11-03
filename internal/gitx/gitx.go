@@ -282,6 +282,7 @@ func attachHunks(files []*File, patch []byte) {
 	var h *Hunk
 	sc := bufio.NewScanner(bytes.NewReader(patch))
 	sc.Buffer(make([]byte, 1<<20), 64<<20)
+	sc.Split(scanLinesKeepCR) // a CRLF line keeps its \r: line-ending changes stay visible
 	for sc.Scan() {
 		l := sc.Text()
 		if strings.HasPrefix(l, "diff --git ") || strings.HasPrefix(l, "diff --cc ") {
@@ -309,6 +310,17 @@ func attachHunks(files []*File, patch []byte) {
 			h.Added = append(h.Added, l[1:])
 		}
 	}
+}
+
+// scanLinesKeepCR splits on \n only (bufio.ScanLines drops a trailing \r).
+func scanLinesKeepCR(data []byte, atEOF bool) (int, []byte, error) {
+	if i := bytes.IndexByte(data, '\n'); i >= 0 {
+		return i + 1, data[:i], nil
+	}
+	if atEOF && len(data) > 0 {
+		return len(data), data, nil
+	}
+	return 0, nil, nil
 }
 
 func atoi(s string) int {

@@ -381,3 +381,19 @@ func TestBudgetIsFair(t *testing.T) {
 		t.Errorf("removals must come first and the rest be summarised:\n%s", out)
 	}
 }
+
+// Found by DeepSeek's round-1 run: a pure LF → CRLF change looked like a whitespace change.
+func TestLineEndings(t *testing.T) {
+	write, commit := repo(t)
+	write("eol.py", "def g():\n    return 1\n")
+	commit("first")
+	write("eol.py", "def g():\r\n    return 1\r\n")
+	out, _ := recap(t)
+	if !strings.Contains(out, "eol.py  modified, +2 −2, line endings only (LF → CRLF)") || strings.Contains(out, "def g") {
+		t.Errorf("got:\n%s", out)
+	}
+	write("eol.py", "def g():\r\n    return 2\r\n")
+	if out, _ = recap(t, "--show", "g"); !strings.Contains(out, "+    return 2␍") {
+		t.Errorf("--show should make the CR visible:\n%s", out)
+	}
+}

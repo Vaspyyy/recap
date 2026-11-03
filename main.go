@@ -570,8 +570,17 @@ func printSymbol(out *bufio.Writer, t target, color bool) {
 		}
 	}
 	for _, l := range lines {
-		fmt.Fprintln(out, colorize(l, color))
+		fmt.Fprintln(out, colorize(visibleCR(l), color))
 	}
+}
+
+// visibleCR shows a line's carriage return, so a CRLF change doesn't look
+// like two identical lines.
+func visibleCR(l string) string {
+	if strings.HasSuffix(l, "\r") {
+		return strings.TrimSuffix(l, "\r") + "␍"
+	}
+	return l
 }
 
 func onOff(color, on bool) string {
