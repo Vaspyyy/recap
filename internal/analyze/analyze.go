@@ -313,6 +313,9 @@ func public(p string, syms []outline.Symbol, i int) bool {
 		strings.HasPrefix(path.Base(lp), "test_") || strings.Contains(lp, ".test.") || strings.Contains(lp, ".spec.") {
 		return false // tests aren't API
 	}
+	if strings.HasSuffix(lp, ".go") && (strings.HasPrefix(lp, "internal/") || strings.Contains(lp, "/internal/")) {
+		return false // nothing outside the module can import an internal package
+	}
 	sig := strings.TrimSpace(s.Sig)
 	parentPublic := s.Parent < 0 || public(p, syms, s.Parent)
 	switch strings.ToLower(path.Ext(p)) {
@@ -510,7 +513,8 @@ func (a *File) compare(oldSyms, newSyms []outline.Symbol, oldLines, newLines []s
 			// lines of a multi-line signature are already in was/now
 			var keep []string
 			for _, l := range c.Detail {
-				if t := strings.TrimSpace(l[1:]); !strings.Contains(osig, t) && !strings.Contains(nsig, strings.TrimSuffix(t, ",")) {
+				t := strings.TrimSuffix(strings.TrimSpace(strings.TrimSuffix(strings.TrimSpace(l[1:]), "{")), ",")
+				if !strings.Contains(osig, t) && !strings.Contains(nsig, t) {
 					keep = append(keep, l)
 				}
 			}
