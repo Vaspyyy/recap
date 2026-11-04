@@ -21,33 +21,6 @@ import (
 
 const version = "0.1.0"
 
-const usage = `recap summarises a git diff by symbol: which functions, types and sections
-changed, were added, removed, renamed or moved.
-
-usage: recap [flags] [<rev> | <rev> <rev> | <a>..<b> | <a>...<b>] [-- <path>...]
-       recap show [flags] [<commit>] [-- <path>...]
-       recap log [-n N] [flags] [<revision range>] [-- <path>...]
-
-  recap                    the working tree (and untracked files) compared with HEAD
-  recap --staged           what's staged for the next commit
-  recap HEAD~3             the working tree compared with HEAD~3
-  recap main...feature     what feature changed since it branched off main
-  recap show abc123        what one commit did, with its message (default HEAD)
-  recap log -n 5           the last five commits, one line per file
-  recap --show gpu.rs:readback    the diff of one symbol
-
-flags:
-  -s, --staged          compare the index (staged changes) with HEAD
-      --show TARGET     print the diff of changed symbols: file:name, name, or a file
-  -p, --patch           print the overview, then git's full diff
-  -n N                  recap log: how many commits (default 10)
-  -b, --budget N        roughly how many lines the overview may use (default 150)
-  -A, --agent           plain output without colors (default when not a terminal)
-      --no-untracked    leave untracked files out
-  -h, --help            show this help
-      --version         show the version
-`
-
 type opts struct {
 	staged, patch, agent, noUntracked bool
 	show                              string
@@ -108,7 +81,7 @@ func parse(args []string) (*opts, int, string) {
 			o.paths = append(o.paths, args[i+1:]...)
 			i = len(args)
 		case a == "-h" || a == "--help":
-			return nil, 0, usage
+			return nil, 0, helpText(wantsColor(os.Stdout))
 		case a == "--version":
 			return nil, 0, "recap " + version + "\n"
 		case a == "-s" || a == "--staged" || a == "--cached":

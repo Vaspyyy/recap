@@ -136,7 +136,7 @@ func Files(files []*analyze.File, o Options) string {
 		for _, ch := range ordered[i] {
 			need[i] += changeLines(ch)
 		}
-		if f.TopReal && len(f.Changes) > 0 {
+		if topLine(f) {
 			need[i]++
 		}
 	}
@@ -259,6 +259,14 @@ func detailKey(f *analyze.File, ch analyze.Change) string {
 	return f.Path + "\x00" + ch.What + "\x00" + ch.Name
 }
 
+// topLine: the file gets an "also … lines outside definitions" line: it
+// has changed symbols too, or symbols but all changes outside them (a var
+// block) and too many changed lines to show them on the file's line.
+func topLine(f *analyze.File) bool {
+	onlyTop := len(f.Changes) == 0 && f.Outlined && len(f.TopLines) == 0 && !f.Untracked && f.Status != 'A' && f.Status != 'D'
+	return f.TopReal && (len(f.Changes) > 0 || onlyTop)
+}
+
 func (w *writer) file(f *analyze.File, changes []analyze.Change, quota int, ind string, details map[string]bool) {
 	c := w.c
 	line := ind + c.bold + Path(f.Path) + c.reset + "  " + status(f, c, false)
@@ -284,7 +292,7 @@ func (w *writer) file(f *analyze.File, changes []analyze.Change, quota int, ind 
 		shown++
 	}
 	topShown := false
-	if f.TopReal && len(f.Changes) > 0 && used < quota {
+	if topLine(f) && used < quota {
 		what := "lines outside definitions"
 		if f.TopImports {
 			what = "imports"

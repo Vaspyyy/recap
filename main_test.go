@@ -532,3 +532,38 @@ func TestShowFromASubdirectory(t *testing.T) {
 		t.Errorf("../h.py from sub/ is h.py:\n%s", out)
 	}
 }
+
+// Found while using recap on glint and seek.
+func TestFoundInUse(t *testing.T) {
+	write, commit := repo(t)
+	write("internal/rules/rules.go", "package rules\n\nvar (\n\ta = 1\n\tb = 2\n\tc = 3\n)\n\nfunc Parse(s string, hash bool) int {\n\tsc := scan{hash: hash}\n\treturn sc.n\n}\n")
+	write("only.go", "package m\n\nvar (\n\tx = 1\n\ty = 2\n\tz = 3\n)\n\nfunc F() {}\n")
+	commit("first")
+	write("internal/rules/rules.go", "package rules\n\nvar (\n\ta = 1\n\tb = 2\n\tc = 3\n)\n\nfunc Parse(s string, lg *lang) int {\n\tsc := scan{hash: lg.hash}\n\treturn sc.n\n}\n")
+	write("only.go", "package m\n\nvar (\n\tx = 10\n\ty = 20\n\tz = 30\n)\n\nfunc F() {}\n")
+	out, _ := recap(t)
+	expect := []string{
+		"was: func Parse(s string, hash bool) int",
+		"- sc := scan{hash: hash}",
+		"only.go  modified, +3 −3\n  also     lines outside definitions  +3 −3",
+	}
+	for _, w := range expect {
+		if !strings.Contains(out, w) {
+			t.Errorf("missing %q in\n%s", w, out)
+		}
+	}
+	for _, bad := range []string{"- func Parse(", "(public)"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("should not contain %q (signature twice, or internal/ as public API):\n%s", bad, out)
+		}
+	}
+}
+
+func TestHelpColorsOnlyWhenAsked(t *testing.T) {
+	if plain := helpText(false); strings.Contains(plain, "\x1b") || !strings.Contains(plain, "--budget N") {
+		t.Errorf("plain help:\n%s", plain)
+	}
+	if colored := helpText(true); !strings.Contains(colored, hSection+"USAGE"+hReset) {
+		t.Errorf("colored help has no colored section titles:\n%s", colored)
+	}
+}
