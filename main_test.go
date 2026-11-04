@@ -558,3 +558,12 @@ func TestFoundInUse(t *testing.T) {
 		}
 	}
 }
+
+func TestHelpColorsOnlyWhenAsked(t *testing.T) {
+	if plain := helpText(false); strings.Contains(plain, "\x1b") || !strings.Contains(plain, "--budget N") {
+		t.Errorf("plain help:\n%s", plain)
+	}
+	if colored := helpText(true); !strings.Contains(colored, hSection+"USAGE"+hReset) {
+		t.Errorf("colored help has no colored section titles:\n%s", colored)
+	}
+}
