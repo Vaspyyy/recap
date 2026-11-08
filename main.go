@@ -306,6 +306,14 @@ func run(args []string) int {
 	if c.json {
 		res := c.recap(comp, commit)
 		res.Files = c.files(files, files)
+		if commit != nil && len(commit.Parents) > 1 {
+			res.Notes = append(res.Notes, "a merge: compared with its first parent")
+		}
+		if comp.New.Worktree || comp.New.Index {
+			if m := gitx.MergeHead(); m != "" {
+				res.Notes = append(res.Notes, "merge in progress: merging "+m+"; resolve the conflicts, then commit (or git merge --abort)")
+			}
+		}
 		return c.emit(res)
 	}
 
@@ -517,7 +525,7 @@ func (c *cli) runLog(top string, o *opts, color bool) int {
 	out := c.out
 	if !gitx.HasCommits() && len(o.revs) == 0 {
 		if c.json {
-			return c.emit(&report.Recap{Files: []report.RecapFile{}, Commits: []report.RecapLog{}})
+			return c.emit(&report.Recap{Files: []report.RecapFile{}, Commits: []report.RecapLog{}, Range: "HEAD"})
 		}
 		fmt.Fprintln(out, "recap log: no commits yet")
 		return 0
@@ -527,7 +535,10 @@ func (c *cli) runLog(top string, o *opts, color bool) int {
 		return c.fail(gitFailure(err))
 	}
 	if c.json { // a log has no sides: old and new stay empty
-		res := &report.Recap{Files: []report.RecapFile{}, Commits: []report.RecapLog{}}
+		res := &report.Recap{Files: []report.RecapFile{}, Commits: []report.RecapLog{}, Range: "HEAD"}
+		if len(o.revs) > 0 {
+			res.Range = strings.Join(o.revs, " ")
+		}
 		for _, cm := range capped(&c.lim, commits) {
 			files, _, err := collect(top, gitx.CommitComparison(cm, o.paths), false)
 			if err != nil {
@@ -626,7 +637,7 @@ func (c *cli) show(comp *gitx.Comparison, commit *gitx.Commit, files []*analyze.
 	}
 	if c.json {
 		res := c.recap(comp, commit)
-		if res.Show, f = c.shows(sel, files, contents); f != nil {
+		if res.Show, res.Notes, f = c.shows(sel, files, contents); f != nil {
 			return c.fail(f)
 		}
 		return c.emit(res)

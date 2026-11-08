@@ -90,7 +90,7 @@ func changesByRef(files []report.RecapFile) map[string]report.RecapChange {
 func defRefs(f report.RecapFile) []string {
 	var out []string
 	for _, d := range f.Defs {
-		out = append(out, d.Ref)
+		out = append(out, d.Symbol.Ref)
 	}
 	return out
 }
@@ -117,10 +117,11 @@ func TestJSONOverview(t *testing.T) {
 		t.Fatalf("want gpu.go, README.md and notes.txt, got %+v", res.Files)
 	}
 	gpu := fileByPath(t, res.Files, "gpu.go")
-	if gpu.Status != "modified" || gpu.Added != 9 || gpu.Removed != 6 || gpu.Lines != 26 || gpu.Outside == nil || *gpu.Outside != (report.LineCounts{Added: 2}) {
+	if gpu.Status != "modified" || gpu.Added != 9 || gpu.Removed != 6 || gpu.Lines != 26 || gpu.Untracked || gpu.Outside == nil ||
+		!reflect.DeepEqual(*gpu.Outside, report.RecapOutside{Added: 2, Imports: true, Lines: []string{`+import "fmt"`}}) {
 		t.Errorf("gpu.go: %+v (outside %+v)", gpu, gpu.Outside)
 	}
-	if n := fileByPath(t, res.Files, "notes.txt"); n.Status != "untracked" || n.Lines != 1 || n.Changes == nil {
+	if n := fileByPath(t, res.Files, "notes.txt"); n.Status != "untracked" || !n.Untracked || n.Lines != 1 || n.Changes == nil || n.Outside != nil {
 		t.Errorf("notes.txt: %+v", n)
 	}
 	ch := changesByRef(res.Files)
@@ -129,16 +130,20 @@ func TestJSONOverview(t *testing.T) {
 		c.Symbol.Line != 7 || c.Symbol.End != 10 || !strings.HasPrefix(c.Symbol.Sig, "func CreateDevice(ctx *Context, debug bool) error") {
 		t.Errorf("CreateDevice: %+v", c)
 	}
+	if c := ch["gpu.go:CreateDevice"]; c.OldLine != 5 || c.OldEnd != 8 {
+		t.Errorf("CreateDevice was at L5-8: %+v", c)
+	}
 	if c := ch["gpu.go:UploadScene"]; c.What != "renamed" || c.OldRef != "gpu.go:Upload" {
 		t.Errorf("UploadScene: %+v", c)
 	}
-	if c := ch["gpu.go:Readback"]; c.What != "changed" || c.Added != 2 || c.Removed != 1 || c.OldSig != "" {
-		t.Errorf("Readback: %+v", c)
+	if c := ch["gpu.go:Readback"]; c.What != "changed" || c.Added != 2 || c.Removed != 1 || c.OldSig != "" ||
+		!reflect.DeepEqual(c.Detail, []string{"-\treturn ctx.n", "+\tfmt.Println(\"readback\")", "+\treturn ctx.n + 1"}) {
+		t.Errorf("Readback, with its changed lines: %+v", c)
 	}
 	if c := ch["gpu.go:Upscale"]; c.What != "added" || c.Symbol.Line != 24 || c.Added != 3 || c.Removed != 0 {
 		t.Errorf("Upscale: %+v", c)
 	}
-	if c := ch["gpu.go:Dispatch"]; c.What != "removed" || c.Symbol.Line != 17 || c.Symbol.End != 19 || c.Removed != 3 {
+	if c := ch["gpu.go:Dispatch"]; c.What != "removed" || c.Symbol.Line != 17 || c.Symbol.End != 19 || c.Removed != 3 || c.OldLine != 0 {
 		t.Errorf("Dispatch (lines of the old version): %+v", c)
 	}
 	if c := ch["README.md:Install"]; c.What != "changed" || c.Symbol.Kind != "h2" {
@@ -185,12 +190,12 @@ func TestJSONRefs(t *testing.T) {
 	if c := ch["internal/group/group.go:Group.Size"]; c.OldRef != "internal/group/group.go:Group.Count" || c.Symbol.Line != 9 {
 		t.Errorf("rename: %+v", c)
 	}
-	if c := ch["nest.py:fresh"]; c.Note != "with 1 inside" || !c.Public || c.Added != 4 {
+	if c := ch["nest.py:fresh"]; c.Members != 1 || c.Note != "" || !c.Public || c.Added != 4 {
 		t.Errorf("an added function with a nested one: %+v", c)
 	}
 	legacy := fileByPath(t, res.Files, "legacy.go")
 	if legacy.Status != "deleted" || legacy.Lines != 9 || len(legacy.Changes) != 0 ||
-		!reflect.DeepEqual(defRefs(legacy), []string{"legacy.go:Gone", "legacy.go:Other"}) || legacy.Defs[0].Line != 3 {
+		!reflect.DeepEqual(defRefs(legacy), []string{"legacy.go:Gone", "legacy.go:Other"}) || legacy.Defs[0].Symbol.Line != 3 || !legacy.Defs[0].Public {
 		t.Errorf("a deleted file lists its definitions: %+v", legacy)
 	}
 	// each ref (and the old name of a rename, and a deleted file's
@@ -210,10 +215,14 @@ func TestJSONRefs(t *testing.T) {
 			continue
 		}
 		got := s.Show[0].Change
+		if got == nil || s.Show[0].File != "" {
+			t.Errorf("--show %s: no change: %+v", target, s.Show[0])
+			continue
+		}
 		if got.Symbol.Ref != target && got.OldRef != target {
 			t.Errorf("--show %s reported %s (was %s)", target, got.Symbol.Ref, got.OldRef)
 		}
-		if c, ok := ch[got.Symbol.Ref]; ok && !reflect.DeepEqual(c, got) {
+		if c, ok := ch[got.Symbol.Ref]; ok && !reflect.DeepEqual(c, *got) {
 			t.Errorf("--show %s: the change differs from the overview's:\n%+v\n%+v", target, got, c)
 		}
 	}
@@ -221,7 +230,7 @@ func TestJSONRefs(t *testing.T) {
 	_, res, _ = recapJSON(t, "show", "HEAD~1")
 	shape := fileByPath(t, res.Files, "shape.rs")
 	if shape.Status != "new" || !reflect.DeepEqual(defRefs(shape)[:3], []string{"shape.rs:Circle", "shape.rs:Circle#2", "shape.rs:Circle.area"}) ||
-		shape.Defs[1].Kind != "impl" {
+		shape.Defs[1].Symbol.Kind != "impl" {
 		t.Errorf("shape.rs: %+v", shape.Defs)
 	}
 	if res.Commit == nil || res.Commit.Parents != nil || res.Old != "nothing" {
@@ -245,7 +254,7 @@ func TestJSONShow(t *testing.T) {
 	}
 	// a whole file: every line of its diff (the 23 old lines, and the 9 added)
 	_, res, _ = recapJSON(t, "--show", "gpu.go")
-	if len(res.Show) != 1 || res.Show[0].Change.Symbol.Kind != "file" || res.Show[0].Change.Symbol.Ref != "gpu.go" ||
+	if len(res.Show) != 1 || res.Show[0].Change != nil || res.Show[0].File != "gpu.go" ||
 		len(res.Show[0].Diff) != 23+9 || res.Show[0].Diff[0] != " package gpu" {
 		t.Errorf("--show gpu.go: %+v", res.Show)
 	}
@@ -272,26 +281,28 @@ func TestJSONMovesAndExtractions(t *testing.T) {
 	write("net/client.ts", "export function fetchUser(id: number, signal?: AbortSignal) {\n  return id + 0;\n}\n\nexport function fetchTeam(id: number) {\n  return id * 1;\n}\n\nexport class Client {\n  get() { return 1; }\n}\n")
 	_, res, _ := recapJSON(t)
 	ch := changesByRef(res.Files)
-	if c := ch["sort.go:compare"]; c.What != "added" || c.From != "sort.go:Compare" || c.Note != "1 line differs" {
-		t.Errorf("an extracted helper: %+v", c)
+	if c := ch["sort.go:compare"]; c.What != "added" || c.From != "sort.go:Compare" || c.Differs != 1 || c.Note != "" ||
+		c.OldLine != 3 || c.OldEnd != 10 || !reflect.DeepEqual(c.Detail, []string{"-\tlb := fold(b)", "+\tlb := b"}) {
+		t.Errorf("an extracted helper (body from Compare at L3-10, one line differs): %+v", c)
 	}
-	if c := ch["cart.py:apply_coupon"]; c.What != "removed" || c.MovedTo != "discounts.py" || c.Note != "unchanged" || !c.Public {
-		t.Errorf("a function moved to another file: %+v", c)
+	if c := ch["cart.py:apply_coupon"]; c.What != "removed" || c.MovedTo != "discounts.py" || c.Differs != 0 || c.Note != "" || !c.Public {
+		t.Errorf("a function moved to another file, unchanged: %+v", c)
 	}
-	if d := fileByPath(t, res.Files, "discounts.py"); d.Status != "untracked" || !reflect.DeepEqual(defRefs(d), []string{"discounts.py:apply_coupon"}) {
-		t.Errorf("discounts.py: %+v", d)
+	if d := fileByPath(t, res.Files, "discounts.py"); d.Status != "untracked" || !reflect.DeepEqual(defRefs(d), []string{"discounts.py:apply_coupon"}) ||
+		d.Defs[0].From != "cart.py:apply_coupon" || d.Defs[0].Differs != 0 || !d.Defs[0].Public {
+		t.Errorf("discounts.py, its definition from cart.py: %+v", d)
 	}
-	if n := fileByPath(t, res.Files, "net/client.ts"); n.Status != "moved" || n.OldPath != "api.ts" || len(n.Changes) == 0 {
-		t.Errorf("a file moved and edited: %+v", n)
+	if n := fileByPath(t, res.Files, "net/client.ts"); n.Status != "moved" || n.OldPath != "api.ts" || !n.Untracked || n.Similarity != 0 || len(n.Changes) == 0 {
+		t.Errorf("a file moved and edited, its new copy untracked: %+v", n)
 	}
 	// --show: the diff from where the body came from
 	_, res, _ = recapJSON(t, "--show", "compare")
-	if len(res.Show) != 1 || res.Show[0].Change.From != "sort.go:Compare" ||
+	if len(res.Show) != 1 || res.Show[0].Change == nil || res.Show[0].Change.From != "sort.go:Compare" ||
 		!contains(res.Show[0].Diff, "-\tlb := fold(b)") || !contains(res.Show[0].Diff, "+\tlb := b") {
 		t.Errorf("--show compare: %+v", res.Show)
 	}
 	_, res, _ = recapJSON(t, "--show", "apply_coupon")
-	if len(res.Show) != 1 || res.Show[0].Change.Symbol.Ref != "discounts.py:apply_coupon" || res.Show[0].Change.From != "cart.py:apply_coupon" ||
+	if len(res.Show) != 1 || res.Show[0].Change == nil || res.Show[0].Change.Symbol.Ref != "discounts.py:apply_coupon" || res.Show[0].Change.From != "cart.py:apply_coupon" ||
 		len(res.Show[0].Diff) != 5 || res.Show[0].Diff[0] != " def apply_coupon(cart, code):" {
 		t.Errorf("--show of a moved function, once, against its old copy: %+v", res.Show)
 	}
@@ -314,7 +325,7 @@ func contains(ls []string, s string) bool {
 
 func TestJSONShowCommitAndLog(t *testing.T) {
 	write, commit := repo(t)
-	if _, res, code := recapJSON(t, "log"); code != 0 || len(res.Commits) != 0 || res.Files == nil {
+	if _, res, code := recapJSON(t, "log"); code != 0 || len(res.Commits) != 0 || res.Files == nil || res.Range != "HEAD" {
 		t.Errorf("log without commits: exit %d, %+v", code, res)
 	}
 	if d, _, code := recapJSON(t, "show"); code != 2 || d.Error == nil || d.Error.Code != report.CodeFailed {
@@ -355,8 +366,11 @@ func TestJSONShowCommitAndLog(t *testing.T) {
 	}
 
 	_, res, code = recapJSON(t, "log", "-n", "5")
-	if code != 0 || res.Files == nil || len(res.Files) != 0 || len(res.Commits) != 2 {
+	if code != 0 || res.Files == nil || len(res.Files) != 0 || len(res.Commits) != 2 || res.Range != "HEAD" || res.Old != "" || res.New != "" {
 		t.Fatalf("log: exit %d, %+v", code, res)
+	}
+	if _, res, _ := recapJSON(t, "log", "HEAD~1..HEAD"); res.Range != "HEAD~1..HEAD" || len(res.Commits) != 1 {
+		t.Errorf("log HEAD~1..HEAD: %+v", res)
 	}
 	second, first := res.Commits[0], res.Commits[1]
 	if second.Commit.Rev != id || second.Commit.Subject != "second" || !second.Commit.Date.Equal(when) ||
@@ -482,14 +496,40 @@ func TestJSONStatuses(t *testing.T) {
 	write("m.go", "package m\n\nfunc Tidy() int {\n\treturn 1\n}\n")
 	write("logo.png", "\x89PNG\x00\x00\x01\n\x02\n")
 	write("go.sum", "a v1 h1:x\n")
+	write("run.sh", "echo hi\n")
+	write("conf.txt", "a\nkeep\n")
+	write("eol.py", "def g():\n    return 1\n")
 	commit("first")
 	os.Remove("old.go")
 	write("new.go", strings.Replace(long, "return 1", "return 2", 1))
 	write("go.sum", "a v1 h1:y\n")
+	os.Chmod("run.sh", 0o755)
+	os.Symlink("conf.txt", "link")
+	write("conf.txt", "b\nkeep\n")
+	write("eol.py", "def g():\r\n    return 1\r\n")
 	commit("rename")
 	_, res, _ := recapJSON(t, "show")
-	if f := fileByPath(t, res.Files, "new.go"); f.Status != "renamed" || f.OldPath != "old.go" || changesByRef(res.Files)["new.go:Keep"].What != "changed" {
+	if f := fileByPath(t, res.Files, "new.go"); f.Status != "renamed" || f.OldPath != "old.go" || f.Similarity < 50 || f.Similarity > 99 ||
+		changesByRef(res.Files)["new.go:Keep"].What != "changed" {
 		t.Errorf("a renamed file: %+v", f)
+	}
+	if f := fileByPath(t, res.Files, "run.sh"); f.ModeChange != "100644 to 100755" {
+		t.Errorf("a mode change: %+v", f)
+	}
+	if f := fileByPath(t, res.Files, "link"); !f.Symlink || f.Status != "new" {
+		t.Errorf("a symlink: %+v", f)
+	}
+	if f := fileByPath(t, res.Files, "eol.py"); f.LineEndings != "LF to CRLF" || len(f.Changes) != 0 {
+		t.Errorf("line endings only: %+v", f)
+	}
+	// a file without outline rules: its changed lines are outside definitions
+	if f := fileByPath(t, res.Files, "conf.txt"); f.Outside == nil ||
+		!reflect.DeepEqual(*f.Outside, report.RecapOutside{Added: 1, Removed: 1, Lines: []string{"-a", "+b"}}) {
+		t.Errorf("conf.txt: %+v", f.Outside)
+	}
+	if _, eol, _ := recapJSON(t, "show", "--show", "eol.py"); len(eol.Show) != 1 || eol.Show[0].File != "eol.py" || len(eol.Show[0].Diff) != 0 ||
+		!reflect.DeepEqual(eol.Notes, []string{"eol.py: line endings only (LF to CRLF), no other change"}) {
+		t.Errorf("--show of a line-ending change: %+v", eol)
 	}
 	if f := fileByPath(t, res.Files, "go.sum"); f.Generated != "lock file" {
 		t.Errorf("a lock file: %+v", f)
@@ -508,7 +548,42 @@ func TestJSONStatuses(t *testing.T) {
 	merge := exec.Command("git", "-c", "user.name=A", "-c", "user.email=a@b", "merge", "-q", "other")
 	merge.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null")
 	merge.Run() // exits 1: the conflict
-	if _, res, _ = recapJSON(t); fileByPath(t, res.Files, "m.go").Status != "conflict" {
-		t.Errorf("a conflict: %+v", res.Files)
+	if _, res, _ = recapJSON(t); fileByPath(t, res.Files, "m.go").Status != "conflict" ||
+		len(res.Notes) != 1 || !strings.HasPrefix(res.Notes[0], "merge in progress: merging other;") {
+		t.Errorf("a conflict: %+v, notes %q", res.Files, res.Notes)
+	}
+}
+
+// What the text says besides the report goes into notes.
+func TestJSONNotes(t *testing.T) {
+	write, commit := repo(t)
+	write("sub/h.py", "def helper():\n    return 1\n")
+	write("h.py", "def helper():\n    return 1\n")
+	commit("first")
+	write("sub/h.py", "def helper():\n    return 2\n")
+	write("h.py", "def helper():\n    return 3\n")
+	os.Chdir("sub")
+	_, res, _ := recapJSON(t, "--show", "h.py:helper")
+	if len(res.Show) != 1 || res.Show[0].Change.Symbol.Ref != "h.py:helper" || len(res.Notes) != 1 ||
+		!strings.HasPrefix(res.Notes[0], "h.py is the file at the repository root (recap reads paths from there, as it prints them); sub/h.py") {
+		t.Errorf("h.py from sub/: %+v, notes %q", res.Show, res.Notes)
+	}
+	if _, res, _ := recapJSON(t, "--show", "sub/h.py:helper"); res.Notes != nil {
+		t.Errorf("no note when the path is unambiguous: %q", res.Notes)
+	}
+	// a merge commit is compared with its first parent
+	os.Chdir("..")
+	commit("second")
+	gitOut(t, "checkout", "-q", "-b", "side", "HEAD~1")
+	write("other.py", "def other():\n    return 1\n")
+	commit("side")
+	gitOut(t, "checkout", "-q", "main")
+	merge := exec.Command("git", "-c", "user.name=A", "-c", "user.email=a@b", "merge", "-q", "--no-edit", "side")
+	merge.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null")
+	if out, err := merge.CombinedOutput(); err != nil {
+		t.Fatalf("merge: %v\n%s", err, out)
+	}
+	if _, res, _ := recapJSON(t, "show"); len(res.Commit.Parents) != 2 || !reflect.DeepEqual(res.Notes, []string{"a merge: compared with its first parent"}) {
+		t.Errorf("a merge commit: %+v, notes %q", res.Commit, res.Notes)
 	}
 }

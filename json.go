@@ -77,22 +77,46 @@ func (c *cli) files(files, all []*analyze.File) []report.RecapFile {
 
 func (c *cli) file(f *analyze.File, all []*analyze.File) report.RecapFile {
 	rf := report.RecapFile{Path: f.Path, OldPath: f.OldPath, Status: fileStatus(f), Added: f.Added, Removed: f.Deleted,
-		Lines: f.Lines, Generated: f.Generated, Binary: f.Binary, Changes: []report.RecapChange{}}
+		Lines: f.Lines, Generated: f.Generated, Binary: f.Binary, LineEndings: arrowless(f.LineEndings),
+		Submodule: f.Submodule, Symlink: f.NewMode == "120000" || f.OldMode == "120000", Untracked: f.Untracked,
+		Changes: []report.RecapChange{}}
+	if (f.Status == 'R' || f.Status == 'C') && f.Similarity > 0 { // -1: a pair git didn't see
+		rf.Similarity = f.Similarity
+	}
+	// as the text says it: a type change and a paired move say it otherwise
+	if f.OldMode != "" && f.NewMode != "" && f.OldMode != f.NewMode && f.OldMode != "000000" && f.NewMode != "000000" &&
+		f.Status != 'T' && f.PairedFrom == nil {
+		rf.ModeChange = f.OldMode + " to " + f.NewMode
+	}
 	for _, ch := range capped(&c.lim, f.Changes) {
 		rf.Changes = append(rf.Changes, change(f, ch, all))
 	}
-	if f.TopPlus+f.TopMinus > 0 {
-		rf.Outside = &report.LineCounts{Added: f.TopPlus, Removed: f.TopMinus}
+	switch {
+	case f.TopPlus+f.TopMinus > 0:
+		rf.Outside = &report.RecapOutside{Added: f.TopPlus, Removed: f.TopMinus, Imports: f.TopImports, Lines: f.TopLines}
+	case !f.Outlined && (f.TopReal || f.TopBlank > 0) && f.Status != 'A' && f.Status != 'D':
+		// no outline rules for it: every changed line is outside a definition
+		rf.Outside = &report.RecapOutside{Added: f.Added, Removed: f.Deleted, Imports: f.TopImports, Lines: f.TopLines}
 	}
 	if len(f.Defs) > 0 { // a new or deleted file: Defs follow its outline one to one
 		syms := f.NewSyms
 		if f.Status == 'D' {
 			syms = f.OldSyms
 		}
-		rf.Defs = capped(&c.lim, report.Symbols(f.Path, syms))
+		for i, sym := range capped(&c.lim, report.Symbols(f.Path, syms)) {
+			d := f.Defs[i]
+			rd := report.RecapDef{Symbol: sym, MovedTo: d.MovedTo, Differs: d.Differs, Public: d.Public}
+			if d.From != "" {
+				rd.From = movedFrom(f.Path, d.From, d.Kind, d.Name, all)
+			}
+			rf.Defs = append(rf.Defs, rd)
+		}
 	}
 	return rf
 }
+
+// arrowless writes analyze's "LF → CRLF" as "LF to CRLF".
+func arrowless(s string) string { return strings.ReplaceAll(s, " → ", " to ") }
 
 // fileStatus is a file's status in one word or two.
 func fileStatus(f *analyze.File) string {
@@ -127,7 +151,10 @@ func change(f *analyze.File, ch analyze.Change, all []*analyze.File) report.Reca
 	sym := report.Symbol{Ref: ref.Symbol(f.Path, ch.Name, ch.Ordinal).String(), Path: f.Path, Name: ch.Name, Kind: ch.Kind,
 		Line: ch.Line, End: max(ch.End, ch.Line), Sig: outlineSig(syms, ch.Kind, ch.Name, ch.Line)}
 	rc := report.RecapChange{What: ch.What, Symbol: sym, OldSig: ch.OldSig, NewSig: ch.NewSig, Added: ch.Plus, Removed: ch.Minus,
-		MovedTo: ch.MovedTo, Note: changeNote(ch), Public: ch.Public}
+		MovedTo: ch.MovedTo, Note: ch.Note, Public: ch.Public, Differs: ch.Differs, Members: ch.Members, Detail: ch.Detail}
+	if ch.What != "removed" { // a removed symbol's own lines are the old ones
+		rc.OldLine, rc.OldEnd = ch.OldLine, ch.OldEnd
+	}
 	switch ch.What {
 	case "renamed":
 		rc.OldRef = ref.Symbol(f.Path, ch.OldName, ch.OldOrdinal).String()
@@ -138,34 +165,11 @@ func change(f *analyze.File, ch analyze.Change, all []*analyze.File) report.Reca
 	}
 	switch {
 	case ch.FromFile != "":
-		rc.From = movedFrom(f, ch, all)
+		rc.From = movedFrom(f.Path, ch.FromFile, ch.Kind, ch.Name, all)
 	case ch.From != "":
 		rc.From = extractedFrom(f, ch)
 	}
 	return rc
-}
-
-// changeNote is what the text says in parentheses that has no field of its
-// own: whether a moved or extracted body differs, members, recap's note.
-func changeNote(ch analyze.Change) string {
-	var notes []string
-	if ch.FromFile != "" || ch.MovedTo != "" || ch.From != "" {
-		switch ch.Differs {
-		case 0:
-			notes = append(notes, "unchanged")
-		case 1:
-			notes = append(notes, "1 line differs")
-		default:
-			notes = append(notes, fmt.Sprintf("%d lines differ", ch.Differs))
-		}
-	}
-	if ch.Members > 0 {
-		notes = append(notes, fmt.Sprintf("with %d inside", ch.Members))
-	}
-	if ch.Note != "" {
-		notes = append(notes, ch.Note)
-	}
-	return strings.Join(notes, "; ")
 }
 
 // outlineSig is the outline's signature (the defining line, trimmed) of the
@@ -192,43 +196,56 @@ func extractedFrom(f *analyze.File, ch analyze.Change) string {
 	return ref.Symbol(f.Path, ch.From, 0).String()
 }
 
-// movedFrom is the ref of the definition in another file that an added one
-// moved from (analyze.Link paired them).
-func movedFrom(f *analyze.File, ch analyze.Change, all []*analyze.File) string {
+// movedFrom is the ref of the definition in file from that the definition
+// kind name in path moved from (analyze.Link paired them).
+func movedFrom(path, from, kind, name string, all []*analyze.File) string {
 	for _, g := range all {
-		if g.Path != ch.FromFile {
+		if g.Path != from {
 			continue
 		}
 		for _, gc := range g.Changes {
-			if gc.What == "removed" && gc.Kind == ch.Kind && gc.Name == ch.Name && gc.MovedTo == f.Path {
+			if gc.What == "removed" && gc.Kind == kind && gc.Name == name && gc.MovedTo == path {
 				return ref.Symbol(g.Path, gc.Name, gc.Ordinal).String()
 			}
 		}
 		for _, d := range g.Defs {
-			if g.Status == 'D' && d.Kind == ch.Kind && d.Name == ch.Name && d.MovedTo == f.Path {
+			if g.Status == 'D' && d.Kind == kind && d.Name == name && d.MovedTo == path {
 				return ref.Symbol(g.Path, d.Name, d.Ordinal).String()
 			}
 		}
 	}
-	return ref.Symbol(ch.FromFile, ch.Name, 0).String()
+	return ref.Symbol(from, name, 0).String()
 }
 
 // shows maps what --show selected: each symbol's change and its whole diff
-// (the text keeps three lines of context; programs get every line).
-func (c *cli) shows(sel selection, files []*analyze.File, contents map[string]pair) ([]report.RecapShow, *failure) {
-	out := []report.RecapShow{}
+// (the text keeps three lines of context; programs get every line), or
+// each file's. Notes says what the text says besides.
+func (c *cli) shows(sel selection, files []*analyze.File, contents map[string]pair) (shows []report.RecapShow, notes []string, f *failure) {
+	shows = []report.RecapShow{}
+	if sel.note != "" {
+		notes = append(notes, strings.TrimPrefix(sel.note, "note: "))
+	}
 	for _, t := range sel.hits {
-		out = append(out, report.RecapShow{Change: change(t.f, t.ch, files), Diff: capped(&c.lim, diffLines(t.ch))})
+		ch := change(t.f, t.ch, files)
+		shows = append(shows, report.RecapShow{Change: &ch, Diff: capped(&c.lim, diffLines(t.ch))})
 	}
 	for _, f := range capped(&c.lim, sel.whole) {
-		s, fl := wholeFile(f, contents)
-		if fl != nil {
-			return nil, fl
+		if f.LineEndings != "" {
+			notes = append(notes, fmt.Sprintf("%s: line endings only (%s), no other change", f.Path, arrowless(f.LineEndings)))
+			shows = append(shows, report.RecapShow{File: f.Path, Diff: []string{}})
+			continue
 		}
-		s.Diff = capped(&c.lim, s.Diff)
-		out = append(out, s)
+		ops, fl := fileDiff(f, contents)
+		if fl != nil {
+			return nil, nil, fl
+		}
+		diff := []string{}
+		for _, o := range ops {
+			diff = append(diff, string(o.Kind)+o.Text)
+		}
+		shows = append(shows, report.RecapShow{File: f.Path, Diff: capped(&c.lim, diff)})
 	}
-	return out, nil
+	return shows, notes, nil
 }
 
 // diffLines is a symbol's diff against its old version, or against where
@@ -259,34 +276,4 @@ func diffLines(ch analyze.Change) []string {
 		}
 	}
 	return lines
-}
-
-// wholeFile is "recap --show path" for one file. report.RecapShow has no
-// form for a file, so its change is the file's: kind "file", its path as
-// the ref, its status as what happened to it.
-func wholeFile(f *analyze.File, contents map[string]pair) (report.RecapShow, *failure) {
-	what := "changed"
-	switch {
-	case f.Untracked && f.PairedFrom == nil, f.Status == 'A':
-		what = "added"
-	case f.Status == 'D':
-		what = "removed"
-	case f.OldPath != "":
-		what = "renamed"
-	}
-	ch := report.RecapChange{What: what, Symbol: report.Symbol{Ref: f.Path, Path: f.Path, Kind: "file", Line: 1, End: max(f.Lines, 1)},
-		OldRef: f.OldPath, Added: f.Added, Removed: f.Deleted}
-	if f.LineEndings != "" {
-		ch.Note = "line endings only (" + f.LineEndings + ")"
-		return report.RecapShow{Change: ch, Diff: []string{}}, nil
-	}
-	ops, fl := fileDiff(f, contents)
-	if fl != nil {
-		return report.RecapShow{}, fl
-	}
-	diff := []string{}
-	for _, o := range ops {
-		diff = append(diff, string(o.Kind)+o.Text)
-	}
-	return report.RecapShow{Change: ch, Diff: diff}, nil
 }
