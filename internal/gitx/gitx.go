@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // git runs with a fixed, script-friendly configuration whatever the user's
@@ -53,6 +54,14 @@ func Toplevel() (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
+// ArgError is a problem with what the user asked for (an unknown revision,
+// too many revisions, a range --staged can't take), not a failure of git.
+type ArgError struct{ Msg string }
+
+func (e *ArgError) Error() string { return e.Msg }
+
+func argErrorf(format string, a ...any) error { return &ArgError{Msg: fmt.Sprintf(format, a...)} }
+
 // Side is one end of a comparison.
 type Side struct {
 	Rev      string // a commit id, "" for the working tree, ":" for the index
@@ -60,6 +69,7 @@ type Side struct {
 	Worktree bool
 	Index    bool
 	Empty    bool // the empty tree (before the first commit)
+	Base     bool // the merge base of an A...B range
 }
 
 // Comparison is what to compare, worked out from the user's arguments the
@@ -81,7 +91,7 @@ func (c *Comparison) Describe() string {
 func resolve(rev string) (string, error) {
 	out, err := Run("rev-parse", "--verify", "--quiet", "--end-of-options", rev+"^{commit}")
 	if err != nil || len(bytes.TrimSpace(out)) == 0 {
-		return "", fmt.Errorf("%s: unknown revision (not a commit, branch or tag here)", rev)
+		return "", argErrorf("%s: unknown revision (not a commit, branch or tag here)", rev)
 	}
 	return strings.TrimSpace(string(out)), nil
 }
@@ -112,7 +122,7 @@ func Compare(revs, paths []string, staged bool) (*Comparison, error) {
 	worktree := Side{Label: "working tree", Worktree: true}
 	switch {
 	case staged && (len(revs) > 1 || len(revs) == 1 && strings.Contains(revs[0], "..")):
-		return nil, errors.New("--staged compares the index with one commit (HEAD by default), not with a range")
+		return nil, argErrorf("--staged compares the index with one commit (HEAD by default), not with a range")
 	case staged:
 		c.Old = headOrEmpty()
 		if len(revs) == 1 {
@@ -152,10 +162,10 @@ func Compare(revs, paths []string, staged bool) (*Comparison, error) {
 		if three {
 			out, err := Run("merge-base", ida, idb)
 			if err != nil {
-				return nil, fmt.Errorf("%s and %s have no common ancestor", a, b)
+				return nil, argErrorf("%s and %s have no common ancestor", a, b)
 			}
 			base := strings.TrimSpace(string(out))
-			c.Old = Side{Rev: base, Label: "the branch point"}
+			c.Old = Side{Rev: base, Label: "the branch point", Base: true}
 			c.Desc = fmt.Sprintf("%s since it branched off %s (at %s)", b, a, base[:min(len(base), 9)])
 		}
 		c.DiffArgs = []string{c.Old.Rev, c.New.Rev}
@@ -178,7 +188,7 @@ func Compare(revs, paths []string, staged bool) (*Comparison, error) {
 		c.Old, c.New = Side{Rev: ida, Label: revs[0]}, Side{Rev: idb, Label: revs[1]}
 		c.DiffArgs = []string{ida, idb}
 	default:
-		return nil, errors.New("too many revisions: give one (compared with the working tree), two, or a range A..B")
+		return nil, argErrorf("too many revisions: give one (compared with the working tree), two, or a range A..B")
 	}
 	return c, nil
 }
@@ -430,28 +440,33 @@ func Content(b *Blobs, top string, s Side, path string) ([]byte, error) {
 // Commit is one entry of git log.
 type Commit struct {
 	ID, Short, Author, Age, Date, Subject, Body string
+	Time                                        time.Time // the author date, with its offset (Date is for display)
 	Parents                                     []string
 }
 
 // Log lists commits like git log (newest first).
 func Log(n int, revs, paths []string) ([]Commit, error) {
-	args := []string{"log", "--no-color", "-z", "--date=format:%Y-%m-%d %H:%M", "--format=%H%x1f%h%x1f%an%x1f%ar%x1f%P%x1f%ad%x1f%s%x1f%b"}
+	args := []string{"log", "--no-color", "-z", "--date=format:%Y-%m-%d %H:%M", "--format=%H%x1f%h%x1f%an%x1f%ar%x1f%P%x1f%ad%x1f%aI%x1f%s%x1f%b"}
 	if n > 0 {
 		args = append(args, "-n", strconv.Itoa(n))
 	}
 	args = append(append(args, revs...), pathArgs(paths)...)
 	out, err := Run(args...)
 	if err != nil {
+		if m := err.Error(); strings.Contains(m, "unknown revision") || strings.Contains(m, "bad revision") {
+			return nil, &ArgError{Msg: m} // git's messages are in English here (LC_ALL=C)
+		}
 		return nil, err
 	}
 	var commits []Commit
 	for _, rec := range strings.Split(string(out), "\x00") {
 		f := strings.Split(strings.TrimPrefix(rec, "\n"), "\x1f")
-		if len(f) < 8 {
+		if len(f) < 9 {
 			continue
 		}
+		when, _ := time.Parse(time.RFC3339, f[6])
 		commits = append(commits, Commit{ID: f[0], Short: f[1], Author: f[2], Age: f[3], Parents: strings.Fields(f[4]),
-			Date: f[5], Subject: f[6], Body: strings.TrimSpace(f[7])})
+			Date: f[5], Time: when, Subject: f[7], Body: strings.TrimSpace(f[8])})
 	}
 	return commits, nil
 }
@@ -548,7 +563,7 @@ func ShowCommit(rev string) (Commit, error) {
 	}
 	cs, err := Log(1, []string{id}, nil)
 	if err != nil || len(cs) == 0 {
-		return Commit{}, fmt.Errorf("%s: no such commit", rev)
+		return Commit{}, argErrorf("%s: no such commit", rev)
 	}
 	return cs[0], nil
 }

@@ -38,6 +38,7 @@ var helpSections = []struct {
 		{"-p", "--patch", "", "print the overview, then git's full diff"},
 		{"-b", "--budget", "N", "roughly how many lines the overview may use (default 150)"},
 		{"-A", "--agent", "", "plain output without colors (default when not a terminal)"},
+		{"", "--json", "", "one JSON document for programs instead (Prism's report.Recap)"},
 	}},
 	{"OTHER", []helpFlag{
 		{"-h", "--help", "", "show this help"},
