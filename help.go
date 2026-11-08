@@ -34,7 +34,7 @@ var helpSections = []struct {
 		{"-n", "", "N", "recap log: how many commits (default 10)"},
 	}},
 	{"OUTPUT", []helpFlag{
-		{"", "--show", "TARGET", "print the diff of changed symbols: file:name, name, or a file"},
+		{"", "--show", "TARGET", "print the diff of changed symbols: file:name, file:line, name, or a file"},
 		{"-p", "--patch", "", "print the overview, then git's full diff"},
 		{"-b", "--budget", "N", "roughly how many lines the overview may use (default 150)"},
 		{"-A", "--agent", "", "plain output without colors (default when not a terminal)"},
@@ -53,10 +53,13 @@ var helpExamples = []helpPair{
 	{"recap show abc123", "what one commit did, with its message (default HEAD)"},
 	{"recap log -n 5", "the last five commits, one line per file"},
 	{"recap --show gpu.rs:readback", "the diff of one symbol"},
+	{"recap --show gpu.rs:120", "the diff of the changed symbol containing line 120"},
+	{"recap --show main.go:run@b681ef1", "what commit b681ef1 did to run"},
 }
 
 var helpNotes = []helpPair{
 	{"changes", "changed, added, removed, renamed and moved symbols, with line ranges"},
+	{"refs", "path, path:Name, path:12, @rev and #N name things the same way in glint, seek, recap and crux"},
 	{"NO_COLOR", "set it to turn colors off"},
 }
 

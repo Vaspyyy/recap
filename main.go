@@ -11,9 +11,12 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 
 	"golang.org/x/term"
 
+	"github.com/Vaspyyy/prism/ref"
+	prismrepo "github.com/Vaspyyy/prism/repo" // "repo" is the tests' helper
 	"github.com/Vaspyyy/recap/internal/analyze"
 	"github.com/Vaspyyy/recap/internal/gitx"
 	"github.com/Vaspyyy/recap/internal/render"
@@ -134,7 +137,7 @@ func parse(args []string) (*opts, int, string) {
 	case o.sub == "show" && o.staged:
 		return nil, 2, "recap show is about a commit; --staged doesn't apply"
 	case o.showSet && strings.TrimSpace(o.show) == "":
-		return nil, 2, "--show needs a name: file:name, name, or a file"
+		return nil, 2, "--show needs a target: file:name, file:line, name, or a file"
 	}
 	return o, -1, ""
 }
@@ -158,6 +161,21 @@ func run(args []string) int {
 	defer out.Flush()
 	if o.sub == "log" {
 		return runLog(out, top, o, color)
+	}
+	var showRef ref.Ref
+	detect := sync.OnceValues(func() (*prismrepo.Info, error) { return prismrepo.Detect(".") })
+	if o.showSet {
+		// --show needs the repository to read paths: find it alongside the
+		// comparison's git commands, and wait for it only to tell whether
+		// the text after an '@' is a revision
+		go detect()
+		showRef = ref.Parse(o.show, func(rev string) bool {
+			info, err := detect()
+			return err == nil && info.IsRev(rev)
+		})
+		if msg := atRev(o, showRef); msg != "" {
+			return fail(msg)
+		}
 	}
 
 	var comp *gitx.Comparison
@@ -186,7 +204,11 @@ func run(args []string) int {
 		return fail(err.Error())
 	}
 	if o.showSet {
-		return show(out, comp, files, contents, o.show, color)
+		info, err := detect()
+		if err != nil {
+			return fail(err.Error())
+		}
+		return show(out, comp, files, contents, info, showRef, o.show, color)
 	}
 
 	if commit != nil {
@@ -226,6 +248,37 @@ func run(args []string) int {
 		out.Write(patch)
 	}
 	return 0
+}
+
+// atRev reads "--show main.go:run@b681ef1" as "recap show b681ef1 --show
+// main.go:run". It returns an error when the command names other revisions.
+func atRev(o *opts, r ref.Ref) string {
+	if r.Rev == "" {
+		return ""
+	}
+	plain := r
+	plain.Rev = ""
+	switch {
+	case o.sub == "show" && len(o.revs) == 1:
+		a, errA := gitx.Resolve(o.revs[0])
+		b, errB := gitx.Resolve(r.Rev)
+		if errA == nil && errB == nil && a != b {
+			return fmt.Sprintf("--show %s is about commit %s, but recap show was given %s; give one commit (recap show %s --show %s)",
+				o.show, r.Rev, o.revs[0], r.Rev, render.ShellArg(plain.String()))
+		}
+	case o.sub == "show":
+		o.revs = []string{r.Rev}
+	case len(o.revs) > 0 || o.staged:
+		other := strings.Join(o.revs, " ")
+		if o.staged {
+			other = strings.TrimSpace("--staged " + other)
+		}
+		return fmt.Sprintf("--show %s means recap show %s --show %s, which can't be combined with %s; drop one of them",
+			o.show, r.Rev, render.ShellArg(plain.String()), other)
+	default:
+		o.sub, o.revs = "show", []string{r.Rev}
+	}
+	return ""
 }
 
 func bold(s string, color bool) string {
@@ -406,44 +459,29 @@ func runLog(out *bufio.Writer, top string, o *opts, color bool) int {
 type target struct {
 	f    *analyze.File
 	ch   analyze.Change
-	name string
+	name string // the name it's found by: the change's, or the old one of a rename
+	ord  int    // the name's ordinal in its file ("#N"), 0 if it's unique there
+	old  bool   // name, ord and line belong to the old version
+	line int
 }
 
-// show prints the diff of the changed symbols matching target, or of a file.
-func show(out *bufio.Writer, comp *gitx.Comparison, files []*analyze.File, contents map[string]pair, want string, color bool) int {
-	filePart, name, hasName := strings.Cut(want, ":")
-	if !hasName {
-		filePart, name = "", want
-		for _, f := range files { // "recap --show path": the whole file
-			if f.Path == fromCwd(want) || f.Path == want || strings.HasSuffix(f.Path, "/"+want) {
-				return showFile(out, f, contents, color)
-			}
-		}
-	}
-	if filePart != "" {
-		if p := fromCwd(filePart); p != filePart {
-			for _, f := range files {
-				if f.Path == p {
-					filePart = p
-				}
-			}
-		}
-	}
+// ref is the target's ref as recap prints it: path:name, with "#N" if needed.
+func (t target) ref() string { return ref.Symbol(t.f.Path, t.name, t.ord).String() }
+
+// candidates lists everything --show can print, by each of its names.
+func candidates(files []*analyze.File) []target {
 	var all []target
 	for _, f := range files {
-		if !fileMatches(f.Path, filePart) && !(f.OldPath != "" && fileMatches(f.OldPath, filePart)) {
-			continue
-		}
 		for _, ch := range f.Changes {
-			all = append(all, target{f, ch, ch.Name})
+			all = append(all, target{f, ch, ch.Name, ch.Ordinal, ch.What == "removed", ch.Line})
 			if ch.OldName != "" {
-				all = append(all, target{f, ch, ch.OldName})
+				all = append(all, target{f, ch, ch.OldName, ch.OldOrdinal, true, ch.OldLine})
 			}
 		}
 		for _, d := range f.Defs {
-			ch := analyze.Change{What: "added", Kind: d.Kind, Name: d.Name, Line: d.Line, End: d.End, NewText: d.Text, FromFile: d.From}
+			ch := analyze.Change{What: "added", Kind: d.Kind, Name: d.Name, Ordinal: d.Ordinal, Line: d.Line, End: d.End, NewText: d.Text, FromFile: d.From}
 			if f.Status == 'D' {
-				ch = analyze.Change{What: "removed", Kind: d.Kind, Name: d.Name, Line: d.Line, End: d.End, OldLine: d.Line, OldEnd: d.End,
+				ch = analyze.Change{What: "removed", Kind: d.Kind, Name: d.Name, Ordinal: d.Ordinal, Line: d.Line, End: d.End, OldLine: d.Line, OldEnd: d.End,
 					OldText: d.Text, MovedTo: d.MovedTo}
 			}
 			if d.From != "" { // the other copy, for a real diff of the move
@@ -460,60 +498,105 @@ func show(out *bufio.Writer, comp *gitx.Comparison, files []*analyze.File, conte
 					}
 				}
 			}
-			all = append(all, target{f, ch, d.Name})
+			all = append(all, target{f, ch, d.Name, d.Ordinal, f.Status == 'D', d.Line})
 		}
 	}
-	// a name matches itself or a qualified name ending in it ("open" finds
-	// Repo.open and open alike); a class or type name finds its changed members
+	return all
+}
+
+// show prints the diff of the changed symbols a ref names, or of a file.
+func show(out *bufio.Writer, comp *gitx.Comparison, files []*analyze.File, contents map[string]pair, info *prismrepo.Info, r ref.Ref,
+	want string, color bool) int {
+	cwd, _ := os.Getwd()
+	matched, note := changedFiles(info, r.Path, cwd, files)
+	if !r.HasTarget || r.Name == "" && !r.IsLocation() { // "recap --show path": the whole file
+		if len(matched) > 0 {
+			if note != "" {
+				fmt.Fprintln(out, note)
+			}
+			return showFiles(out, matched, contents, want, color)
+		}
+		r = r.AsName() // a bare name: "Readback", "Repo.open"
+	}
+	scope, missed := files, ""
+	switch {
+	case !r.HasTarget || r.Path == "":
+	case len(matched) > 0:
+		scope = matched
+	case r.IsLocation():
+		return fail(fileMiss(info, r.Path, cwd, comp) + changedList(candidates(files), "changed"))
+	default: // a name with ':' in it (C++ "Foo::bar", Lua "obj:method"), or a file that didn't change
+		missed, r = r.Path, r.AsName()
+	}
+	in := map[*analyze.File]bool{}
+	for _, f := range scope {
+		in[f] = true
+	}
+	var all []target
+	for _, t := range candidates(files) {
+		if in[t.f] {
+			all = append(all, t)
+		}
+	}
 	var hits []target
-	seen := map[string]bool{}
-	add := func(match func(string) bool) {
-		for _, t := range all {
-			k := t.f.Path + "\x00" + t.ch.What + "\x00" + t.ch.Name
-			if !seen[k] && match(t.name) {
-				hits = append(hits, t)
-				seen[k] = true
+	if r.IsLocation() {
+		var why string
+		if hits, why = located(r, scope, all, comp); len(hits) == 0 {
+			return fail(why)
+		}
+	} else {
+		hits = named(r, scope, all)
+		if len(hits) == 0 && r.Ordinal == 0 { // a class or type name finds its changed members
+			for _, t := range all {
+				if strings.HasPrefix(t.name, r.Name+".") {
+					hits = append(hits, t)
+				}
 			}
 		}
 	}
-	add(func(n string) bool { return n == name || strings.HasSuffix(n, "."+name) })
-	if len(hits) == 0 {
-		add(func(n string) bool { return strings.HasPrefix(n, name+".") })
-	}
-	// a move is one change: show it once, as the diff from the old copy
+	// one entry per change (a rename can be found by both names), and a
+	// move is one change: show it once, as the diff from the old copy
 	var dedup []target
+	seen, added := map[string]bool{}, map[string]bool{}
 	for _, t := range hits {
-		if t.ch.What == "removed" && t.ch.MovedTo != "" && seen[t.ch.MovedTo+"\x00added\x00"+t.ch.Name] {
-			continue
+		k := fmt.Sprintf("%p\x00%s\x00%s\x00%d", t.f, t.ch.What, t.ch.Name, t.ch.Line)
+		if !seen[k] {
+			seen[k] = true
+			dedup = append(dedup, t)
+			if t.ch.What == "added" {
+				added[t.f.Path+"\x00"+t.ch.Name] = true
+			}
 		}
-		dedup = append(dedup, t)
 	}
-	hits = dedup
+	hits = hits[:0]
+	for _, t := range dedup {
+		if !(t.ch.What == "removed" && t.ch.MovedTo != "" && added[t.ch.MovedTo+"\x00"+t.ch.Name]) {
+			hits = append(hits, t)
+		}
+	}
 	switch {
 	case len(hits) == 0:
-		var names []string
-		for _, t := range all {
-			if t.name == t.ch.Name {
-				names = append(names, t.f.Path+":"+t.ch.Name)
-			}
-		}
-		if len(names) == 0 {
+		list := changedList(all, "changed")
+		switch {
+		case list == "":
 			hint := ""
 			if comp.New.Worktree {
 				hint = " (--show looks at the working tree unless you give a commit or range: recap main...feature --show " + want + ")"
 			}
 			return fail("nothing changed matches " + strconv.Quote(want) + " in " + comp.Describe() + hint)
+		case missed != "":
+			return fail(fileMiss(info, missed, cwd, comp) + list)
 		}
-		if len(names) > 12 {
-			names = append(names[:12], fmt.Sprintf("… +%d more", len(names)-12))
-		}
-		return fail("no changed symbol matches " + strconv.Quote(want) + "; changed: " + strings.Join(names, ", "))
+		return fail("no changed symbol matches " + strconv.Quote(want) + list)
 	case len(hits) > 8:
 		var names []string
 		for _, t := range hits[:8] {
-			names = append(names, t.f.Path+":"+t.ch.Name)
+			names = append(names, t.ref())
 		}
 		return fail(fmt.Sprintf("%q matches %d symbols; be more specific, e.g. %s", want, len(hits), strings.Join(names, ", ")))
+	}
+	if note != "" {
+		fmt.Fprintln(out, note)
 	}
 	if len(hits) > 1 {
 		fmt.Fprintf(out, "%d matches for %s\n\n", len(hits), strconv.Quote(want))
@@ -527,29 +610,212 @@ func show(out *bufio.Writer, comp *gitx.Comparison, files []*analyze.File, conte
 	return 0
 }
 
-// fromCwd turns a path relative to the working directory into one
-// relative to the repository root, as git prints them.
-func fromCwd(p string) string {
-	top, err1 := gitx.Toplevel()
-	wd, err2 := os.Getwd()
-	if err1 != nil || err2 != nil {
-		return p
+// changedFiles returns the files of the comparison p names, by their path
+// or by the old path of a rename (prism/repo: relative to the root, to the
+// working directory, absolute, or a unique suffix). The note says when p
+// also names another changed file relative to the working directory.
+func changedFiles(info *prismrepo.Info, p, cwd string, files []*analyze.File) ([]*analyze.File, string) {
+	var paths []string
+	has := map[string]bool{}
+	for _, f := range files {
+		for _, q := range []string{f.Path, f.OldPath} {
+			if q != "" && !has[q] {
+				has[q] = true
+				paths = append(paths, q)
+			}
+		}
 	}
-	if real, err := filepath.EvalSymlinks(wd); err == nil {
-		wd = real
+	names := map[string]bool{}
+	for _, n := range info.Match(p, cwd, paths) {
+		names[n] = true
 	}
-	if real, err := filepath.EvalSymlinks(top); err == nil {
-		top = real
+	var out []*analyze.File
+	for _, f := range files {
+		if names[f.Path] || f.OldPath != "" && names[f.OldPath] {
+			out = append(out, f)
+		}
 	}
-	rel, err := filepath.Rel(top, filepath.Join(wd, p))
-	if err != nil || strings.HasPrefix(rel, "..") {
-		return p
+	note := ""
+	if rs := info.Readings(p, cwd); len(rs) > 1 && len(names) == 1 && names[rs[0]] && has[rs[1]] {
+		note = fmt.Sprintf("note: %s is the file at the repository root (recap reads paths from there, as it prints them); %s, relative to here, changed too",
+			render.Path(rs[0]), render.Path(rs[1]))
 	}
-	return filepath.ToSlash(rel)
+	return out, note
 }
 
-func fileMatches(p, want string) bool {
-	return want == "" || p == want || strings.HasSuffix(p, "/"+want)
+// showFiles prints the diff of whole files.
+func showFiles(out *bufio.Writer, files []*analyze.File, contents map[string]pair, want string, color bool) int {
+	if len(files) > 1 {
+		fmt.Fprintf(out, "%d matches for %s\n\n", len(files), strconv.Quote(want))
+	}
+	for k, f := range files {
+		if k > 0 {
+			fmt.Fprintln(out)
+		}
+		if code := showFile(out, f, contents, color); code != 0 {
+			return code
+		}
+	}
+	return 0
+}
+
+// named returns the targets a name ref picks (prism/ref: the exact name,
+// else a name ending in it at a '.', "#N", a type before its impls). It
+// matches against the whole outlines of the files, so "#N" counts every
+// definition by that name, changed or not, as the overview does.
+func named(r ref.Ref, scope []*analyze.File, all []target) []target {
+	type side struct {
+		f   *analyze.File
+		old bool
+	}
+	names := map[side]map[string]bool{}
+	for _, t := range all {
+		s := side{t.f, t.old}
+		if names[s] == nil {
+			names[s] = map[string]bool{}
+		}
+		names[s][t.name] = true
+	}
+	var ts []ref.Target
+	var from []side
+	for i, f := range scope {
+		for _, old := range []bool{false, true} {
+			s, syms, key := side{f, old}, f.NewSyms, strconv.Itoa(i)+" new"
+			if old {
+				syms, key = f.OldSyms, strconv.Itoa(i)+" old"
+			}
+			for _, t := range ref.Targets(key, syms) {
+				if names[s][t.Name] { // all definitions by a changed name, for the ordinals
+					ts = append(ts, t)
+					from = append(from, s)
+				}
+			}
+		}
+	}
+	var hits []target
+	for _, k := range ref.Match(r, ts, nil) {
+		for _, t := range all {
+			if t.f == from[k].f && t.old == from[k].old && t.name == ts[k].Name && t.line == ts[k].Line {
+				hits = append(hits, t)
+			}
+		}
+	}
+	return hits
+}
+
+// located returns the changed symbol containing a location ref's line (in
+// the new version), or the changed symbols in its range. Without one, why
+// says which symbol holds the line, that it didn't change, and what did.
+func located(r ref.Ref, scope []*analyze.File, all []target, comp *gitx.Comparison) (hits []target, why string) {
+	var whys []string
+	for _, f := range scope {
+		old := f.Status == 'D' // a deleted file only has its old lines
+		syms := f.NewSyms
+		if old {
+			syms = f.OldSyms
+		}
+		ts := ref.Targets(f.Path, syms)
+		find := func(k int) *target {
+			for i, t := range all {
+				if t.f == f && t.old == old && t.name == ts[k].Name && t.line == ts[k].Line {
+					return &all[i]
+				}
+			}
+			return nil
+		}
+		j := innermost(ts, f.Path, r.Line, r.End)
+		found := false
+		// a definition inside an added or renamed one isn't a change of its
+		// own: the enclosing one is
+		for k := j; k >= 0; k = syms[k].Parent {
+			if t := find(k); t != nil {
+				if k == j || t.ch.What == "added" || t.ch.What == "renamed" {
+					hits, found = append(hits, *t), true
+				}
+				break
+			}
+		}
+		if !found && r.End > 0 && j < 0 { // a range across definitions: the changed ones in it
+			for _, t := range all {
+				if t.f == f && t.old == old && t.name == t.ch.Name && t.line <= r.End && max(t.ch.End, t.line) >= r.Line {
+					hits, found = append(hits, t), true
+				}
+			}
+		}
+		if found {
+			continue
+		}
+		loc := r
+		loc.Path, loc.Rev = f.Path, ""
+		var w string
+		switch {
+		case j >= 0:
+			w = fmt.Sprintf("%s is in %s (L%s), which didn't change in %s", loc, ref.Refs(ts)[j], render.Span(ts[j].Line, ts[j].End), comp.Describe())
+		case r.Line > f.Lines:
+			w = fmt.Sprintf("%s is past the end of %s (%s)", loc, render.Path(f.Path), render.Plural(f.Lines, "line"))
+		case r.End > 0:
+			w = fmt.Sprintf("%s holds no changed symbol", loc)
+		default:
+			w = fmt.Sprintf("%s isn't inside a symbol", loc)
+		}
+		var mine []target
+		for _, t := range all {
+			if t.f == f {
+				mine = append(mine, t)
+			}
+		}
+		if list := changedList(mine, "changed in "+render.Path(f.Path)); list != "" {
+			w += list
+		} else {
+			w += "; no symbol in it changed (recap --show " + render.ShellArg(f.Path) + " shows its diff)"
+		}
+		whys = append(whys, w)
+	}
+	return hits, strings.Join(whys, "; ")
+}
+
+// innermost is the innermost target in path containing the line, or the
+// whole range when end > 0; -1 if none.
+func innermost(ts []ref.Target, path string, line, end int) int {
+	if end == 0 {
+		return ref.Innermost(ts, path, line)
+	}
+	best := -1
+	for i, t := range ts {
+		if t.Path != path || line < t.Line || end > max(t.End, t.Line) {
+			continue
+		}
+		if best < 0 || max(t.End, t.Line)-t.Line < max(ts[best].End, ts[best].Line)-ts[best].Line {
+			best = i
+		}
+	}
+	return best
+}
+
+// changedList is "; changed: a.go:X, b.go:Y" for the targets (by their
+// current names), or "" if there are none.
+func changedList(all []target, label string) string {
+	var names []string
+	for _, t := range all {
+		if t.name == t.ch.Name {
+			names = append(names, t.ref())
+		}
+	}
+	if len(names) == 0 {
+		return ""
+	}
+	if len(names) > 12 {
+		names = append(names[:12], fmt.Sprintf("… +%d more", len(names)-12))
+	}
+	return "; " + label + ": " + strings.Join(names, ", ")
+}
+
+// fileMiss says why a ref's path names no changed file.
+func fileMiss(info *prismrepo.Info, p, cwd string, comp *gitx.Comparison) string {
+	if res, err := info.Resolve(p, cwd); err == nil && res.Exists {
+		return render.Path(res.Rel) + " didn't change in " + comp.Describe()
+	}
+	return "no changed file matches " + strconv.Quote(p) + " in " + comp.Describe()
 }
 
 // printSymbol prints one symbol's diff: against its old version, or against
@@ -571,9 +837,9 @@ func printSymbol(out *bufio.Writer, t target, color bool) {
 	case ch.What != "added" && ch.OldLine > 0 && (ch.OldLine != ch.Line || ch.OldEnd != ch.End):
 		where += ", was L" + render.Span(ch.OldLine, ch.OldEnd)
 	}
-	label := render.Label(ch.Kind, ch.Name)
+	label := render.Label(ch.Kind, ch.RefName())
 	if ch.What == "renamed" {
-		label = render.Label(ch.Kind, ch.OldName) + " → " + ch.Name
+		label = render.Label(ch.Kind, ch.OldRefName()) + " → " + ch.RefName()
 	}
 	fmt.Fprintf(out, "%s%s %s%s  (%s)\n", onOff(color, true), ch.What, label, onOff(color, false), where)
 	if against != "" {

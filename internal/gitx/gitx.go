@@ -86,6 +86,9 @@ func resolve(rev string) (string, error) {
 	return strings.TrimSpace(string(out)), nil
 }
 
+// Resolve returns the id of the commit rev names.
+func Resolve(rev string) (string, error) { return resolve(rev) }
+
 func emptyTree() string {
 	out, err := Run("hash-object", "-t", "tree", "/dev/null")
 	if err != nil {

@@ -33,7 +33,13 @@ notes.txt  untracked, 12 lines
 | What did one commit do (with its message)? | `recap show <commit>` (default HEAD) |
 | What did the last commits do? | `recap log -n 5` (one line per file, with the first paragraph of each message) |
 | Show me that one function's change | `recap --show path/file.go:Name` (or just `Name`; every match is shown; a class name shows its changed members) |
+| What changed where this error points? | `recap --show path/file.go:312` (the changed symbol containing line 312) |
+| What did a commit do to one function? | `recap --show path/file.go:Name@b681ef1` (same as `recap show b681ef1 --show path/file.go:Name`) |
 | The overview and then the full diff | `recap -p` |
+
+## Refs
+
+glint, seek, recap and crux all print and accept the same refs: `path`, `path:Name` (qualified: `Repo.Open`, `outer.inner`), `path:12` / `12:3` / `12-40` (a line, with a column, a range; resolved to the innermost symbol containing it), `@rev` (a symbol as it was in a commit) and `#N` (the Nth of several definitions with the same name). Paths are repo-relative. Copy refs from any tool's output into `--show`: in the overview, a file's path + `:` + a symbol's name as shown is one (`outline/outline.go:scanner.stripComments`), and so are a compiler's or crux's `file:line`.
 
 Paths after `--` limit everything to those files: `recap HEAD~3 -- src/`. Moves to files outside the paths can't be seen then. `--show` works on whatever the command compares: on a clean working tree, give the range (`recap main...feature --show name`).
 
@@ -58,6 +64,6 @@ Lines in `--show` are clipped at 400 characters and the output stops after 400 l
 
 ## Limits
 
-Symbols use the same outline rules as `glint -A <file>`, so languages glint can't outline get counts only. If `--show name` says no changed symbol matches, it lists the changed ones; pick from that list (`file:name` must match exactly, e.g. not `main.go:main` when `main` didn't change).
+Symbols use the same outline rules as `glint -A <file>`, so languages glint can't outline get counts only. If `--show name` says no changed symbol matches, it lists the changed ones as refs; pick from that list (e.g. not `main.go:main` when `main` didn't change). A name matches exactly, else as the end of a qualified name (`stripComments` finds `scanner.stripComments`). For a line outside every changed symbol, recap names the symbol that holds it, says it didn't change, and lists what did.
 
 recap matches symbols by kind and name, so a symbol that was renamed and heavily rewritten at the same time shows as removed plus added. Definitions the outline rules don't know (Go `var` blocks, macros, config keys) count as lines outside definitions. When the exact change matters, use `--show`, or `git diff` for files without symbols.
