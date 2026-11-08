@@ -23,13 +23,27 @@ import (
 
 // git runs with a fixed, script-friendly configuration whatever the user's
 // settings are: no pager, no colors, no external diff tools or textconv,
-// unquoted paths, English messages.
-var baseArgs = []string{"-c", "core.quotepath=off", "-c", "color.ui=false", "-c", "diff.noprefix=false",
-	"-c", "diff.mnemonicPrefix=false", "-c", "diff.relative=false", "--no-pager"}
+// unquoted paths, English messages, no signature checks in git log's
+// records, and a patch in the shape recap parses: every file, a submodule
+// too, gets a "diff --git" header (diff.submodule=log prints a submodule
+// without one), hunks aren't merged across unchanged lines, and paths are
+// the repository's.
+var baseArgs = []string{"-c", "core.quotepath=off", "-c", "color.ui=false", "-c", "color.diff=false",
+	"-c", "diff.noprefix=false", "-c", "diff.mnemonicPrefix=false", "-c", "diff.relative=false",
+	"-c", "diff.submodule=short", "-c", "diff.interHunkContext=0", "-c", "log.showSignature=false", "--no-pager"}
+
+// unsetEnv are variables that change what git's output or arguments mean:
+// pathspec modes (recap's own pathspecs use magic like ":(top,exclude)")
+// and diff options from the environment.
+var unsetEnv = []string{"GIT_LITERAL_PATHSPECS", "GIT_GLOB_PATHSPECS", "GIT_NOGLOB_PATHSPECS", "GIT_ICASE_PATHSPECS", "GIT_DIFF_OPTS"}
 
 func command(args ...string) *exec.Cmd {
 	cmd := exec.Command("git", append(append([]string(nil), baseArgs...), args...)...)
-	cmd.Env = append(os.Environ(), "LC_ALL=C", "LANGUAGE=en", "GIT_PAGER=cat", "GIT_EXTERNAL_DIFF=", "GIT_CONFIG_NOSYSTEM=")
+	env := slices.DeleteFunc(os.Environ(), func(kv string) bool {
+		k, _, _ := strings.Cut(kv, "=")
+		return slices.Contains(unsetEnv, k)
+	})
+	cmd.Env = append(env, "LC_ALL=C", "LANGUAGE=en", "GIT_PAGER=cat", "GIT_EXTERNAL_DIFF=", "GIT_CONFIG_NOSYSTEM=")
 	return cmd
 }
 
@@ -239,7 +253,7 @@ func Files(c *Comparison) ([]*File, error) {
 		// git can't count or diff a tracked path that's now a named pipe,
 		// socket or device ("unsupported file type"): leave those out and
 		// list them as deleted
-		if special = c.findSpecial(); len(special) == 0 {
+		if special = c.findSpecial(); len(c.special) == 0 {
 			return nil, err
 		}
 		out, err = Run(append(append(append(common, "--raw", "-z", "--numstat"), c.DiffArgs...), c.pathArgs()...)...)
@@ -291,9 +305,15 @@ func (c *Comparison) findSpecial() []*File {
 		if err != nil {
 			continue
 		}
-		if kind := specialKind(st.Mode()); kind != "" {
+		kind := specialKind(st.Mode())
+		if kind == "" {
+			continue
+		}
+		c.special = append(c.special, f.Path)
+		// listed as deleted only if the old side had it: a path added since
+		// (staged, or after the commit compared with) has nothing to delete
+		if f.Status != 'A' && f.OldMode != "000000" {
 			special = append(special, &File{Status: 'D', Path: f.Path, OldMode: f.OldMode, NewMode: "000000", Special: kind})
-			c.special = append(c.special, f.Path)
 		}
 	}
 	return special

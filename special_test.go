@@ -5,6 +5,7 @@ package main
 import (
 	"encoding/json"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -167,5 +168,90 @@ func TestSpecialFiles(t *testing.T) {
 	}
 	if c := fileByPath(t, res.Files, "c.txt"); c.Status != "type changed" || !c.Symlink {
 		t.Errorf("JSON c.txt: %+v", c)
+	}
+}
+
+// gitIn runs git in dir, with the test's identity and no user config.
+func gitIn(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	cmd.Env = append(os.Environ(), "GIT_AUTHOR_NAME=Ada", "GIT_AUTHOR_EMAIL=ada@example.com",
+		"GIT_COMMITTER_NAME=Ada", "GIT_COMMITTER_EMAIL=ada@example.com", "GIT_CONFIG_GLOBAL=/dev/null")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+}
+
+// The user's git config can't change the patch recap parses:
+// diff.submodule=log prints a submodule without a "diff --git" header, and
+// the files after it got the wrong changed lines.
+func TestSubmodulesWithUserConfig(t *testing.T) {
+	write, commit := repo(t)
+	z := "package z\n\nfunc Z() int {\n\treturn 1\n}\n"
+	write("sub", "a file first\n")
+	write("z.go", z)
+	commit("first")
+	os.Remove("sub") // the file becomes a submodule
+	gitIn(t, ".", "init", "-q", "-b", "main", "sub")
+	write("sub/s.txt", "s\n")
+	gitIn(t, "sub", "add", "-A")
+	gitIn(t, "sub", "commit", "-q", "-m", "s")
+	write("z.go", strings.Replace(z, "return 1", "return 2", 1))
+	commit("submodule")
+	gitIn(t, ".", "config", "diff.submodule", "log")
+	gitIn(t, ".", "config", "diff.interHunkContext", "5")
+	out, code := recap(t, "HEAD~1", "HEAD")
+	if code != 0 || !strings.Contains(out, "\nz.go  modified, +1 −1\n  changed  func Z  L3-5  +1 −1\n") {
+		t.Errorf("a file that became a submodule: exit %d\n%s", code, out)
+	}
+	write("sub/s.txt", "t\n") // the submodule moves on
+	gitIn(t, "sub", "commit", "-q", "-am", "t")
+	write("z.go", strings.Replace(z, "return 1", "return 3", 1))
+	commit("submodule moves")
+	if out, code := recap(t, "HEAD~1", "HEAD"); code != 0 || !strings.Contains(out, "\nz.go  modified, +1 −1\n  changed  func Z  L3-5  +1 −1\n") {
+		t.Errorf("a changed submodule: exit %d\n%s", code, out)
+	}
+}
+
+// A special file at a path the old side never had isn't listed: there's
+// nothing to delete. And the user's environment can't change what recap's
+// pathspecs mean.
+func TestSpecialFilesAtNewPaths(t *testing.T) {
+	write, commit := repo(t)
+	write("a.go", "package a\n\nfunc A() int {\n\treturn 1\n}\n")
+	write("old.txt", "old\n")
+	commit("first")
+	write("later.txt", "later\n")
+	commit("second")
+	pipes := []string{"added.txt", "new.txt", "later.txt"}
+
+	write("added.txt", "new\n") // staged, then a pipe
+	gitIn(t, ".", "add", "added.txt")
+	os.Remove("added.txt")
+	mkfifo(t, "added.txt")
+	gitIn(t, ".", "mv", "old.txt", "new.txt") // a staged rename whose new path is a pipe
+	os.Remove("new.txt")
+	mkfifo(t, "new.txt")
+	write("a.go", "package a\n\nfunc A() int {\n\treturn 2\n}\n")
+	out, code := recapWithin(t, pipes)
+	if code != 0 || strings.Contains(out, "added.txt") || strings.Contains(out, "new.txt") ||
+		!strings.HasPrefix(out, "recap: HEAD → working tree: 2 files changed, +1 −2\n") ||
+		!strings.Contains(out, "\nold.txt  deleted, 1 line\n") || !strings.Contains(out, "\n  changed  func A  L3-5  +1 −1\n") {
+		t.Errorf("paths HEAD didn't have aren't listed: exit %d\n%s", code, out)
+	}
+
+	os.Remove("later.txt") // committed after HEAD~1, a pipe now
+	mkfifo(t, "later.txt")
+	if out, code := recapWithin(t, pipes, "HEAD~1"); code != 0 || strings.Contains(out, "later.txt") {
+		t.Errorf("recap HEAD~1: later.txt wasn't there in HEAD~1: exit %d\n%s", code, out)
+	}
+	if out, _ := recapWithin(t, pipes); !strings.Contains(out, "\nlater.txt  deleted, 1 line, now a named pipe, which git can't diff or add\n") {
+		t.Errorf("recap: HEAD had later.txt:\n%s", out)
+	}
+
+	t.Setenv("GIT_LITERAL_PATHSPECS", "1")
+	if out, code := recapWithin(t, pipes); code != 0 || !strings.Contains(out, "\n  changed  func A  L3-5  +1 −1\n") || !strings.Contains(out, "\nold.txt  deleted") {
+		t.Errorf("GIT_LITERAL_PATHSPECS=1 hides the other changes: exit %d\n%s", code, out)
 	}
 }
