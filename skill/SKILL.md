@@ -39,6 +39,17 @@ notes.txt  untracked, 12 lines
 
 `--json` prints the same as one JSON document for programs (Prism's `report.Recap`, https://github.com/Vaspyyy/prism/blob/main/docs/output.md); read the text yourself, it's shorter.
 
+## Context and next: lines
+
+recap remembers what you looked at, so you don't have to repeat it:
+
+- `recap show <commit>` and two-commit diffs (`recap a b`, `a..b`, `a...b`) set the focus: seek and crux then mark that change's symbols `[focus]`.
+- `recap --show Name` on a clean working tree (or one where `Name` didn't change) shows `Name`'s diff from the focus instead, and the first line says which commit: `context: nothing matches in the working tree; showing focus commit b681ef1`. Give a revision to look elsewhere.
+- `[failing]` after a symbol means it failed in crux's last run; `[focus]` means the focus changed it too. A `context:` first line says where marks come from.
+- `next:` lines at the bottom are commands to run as printed, e.g. `next: seek internal/files/files.go:List   definition and uses by name`, or `recap … --show <ref>` for a change too big to show inline.
+
+`--no-context` (or `PRISM_NO_CONTEXT=1`) ignores and records nothing; you shouldn't need it.
+
 ## Refs
 
 glint, seek, recap and crux all print and accept the same refs: `path`, `path:Name` (qualified: `Repo.Open`, `outer.inner`), `path:12` / `12:3` / `12-40` (a line, with a column, a range; resolved to the innermost symbol containing it), `@rev` (a symbol as it was in a commit) and `#N` (the Nth of several definitions with the same name). Paths are repo-relative. Copy refs from any tool's output into `--show`: in the overview, a file's path + `:` + a symbol's name as shown is one (`outline/outline.go:scanner.stripComments`), and so are a compiler's or crux's `file:line`.

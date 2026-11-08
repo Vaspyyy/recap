@@ -107,6 +107,9 @@ func emptyTree() string {
 	return strings.TrimSpace(string(out))
 }
 
+// EmptyTree is the id of the empty tree: the old side of a root commit.
+func EmptyTree() string { return emptyTree() }
+
 // headOrEmpty is HEAD, or the empty tree in a repository without commits.
 func headOrEmpty() Side {
 	if id, err := resolve("HEAD"); err == nil {

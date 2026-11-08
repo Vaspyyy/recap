@@ -41,6 +41,7 @@ var helpSections = []struct {
 		{"", "--json", "", "one JSON document for programs instead (Prism's report.Recap)"},
 	}},
 	{"OTHER", []helpFlag{
+		{"", "--no-context", "", "ignore and don't record context; also PRISM_NO_CONTEXT=1"},
 		{"-h", "--help", "", "show this help"},
 		{"", "--version", "", "show the version"},
 	}},
@@ -61,6 +62,7 @@ var helpExamples = []helpPair{
 var helpNotes = []helpPair{
 	{"changes", "changed, added, removed, renamed and moved symbols, with line ranges"},
 	{"refs", "path, path:Name, path:12, @rev and #N name things the same way in glint, seek, recap and crux"},
+	{"context", "recap show and A..B record the focus seek and crux use; --show falls back to it; [failing]: failed in crux's last run"},
 	{"NO_COLOR", "set it to turn colors off"},
 }
 

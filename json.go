@@ -89,7 +89,9 @@ func (c *cli) file(f *analyze.File, all []*analyze.File) report.RecapFile {
 		rf.ModeChange = f.OldMode + " to " + f.NewMode
 	}
 	for _, ch := range capped(&c.lim, f.Changes) {
-		rf.Changes = append(rf.Changes, change(f, ch, all))
+		rc := change(f, ch, all)
+		rc.Symbol.Marks = c.marks(ch.Refs(f.Path)...)
+		rf.Changes = append(rf.Changes, rc)
 	}
 	switch {
 	case f.TopPlus+f.TopMinus > 0:
@@ -105,6 +107,7 @@ func (c *cli) file(f *analyze.File, all []*analyze.File) report.RecapFile {
 		}
 		for i, sym := range capped(&c.lim, report.Symbols(f.Path, syms)) {
 			d := f.Defs[i]
+			sym.Marks = c.marks(sym.Ref)
 			rd := report.RecapDef{Symbol: sym, MovedTo: d.MovedTo, Differs: d.Differs, Public: d.Public}
 			if d.From != "" {
 				rd.From = movedFrom(f.Path, d.From, d.Kind, d.Name, all)
@@ -227,6 +230,7 @@ func (c *cli) shows(sel selection, files []*analyze.File, contents map[string]pa
 	}
 	for _, t := range sel.hits {
 		ch := change(t.f, t.ch, files)
+		ch.Symbol.Marks = c.marks(t.ch.Refs(t.f.Path)...)
 		shows = append(shows, report.RecapShow{Change: &ch, Diff: capped(&c.lim, diffLines(t.ch))})
 	}
 	for _, f := range capped(&c.lim, sel.whole) {

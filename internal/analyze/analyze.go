@@ -102,6 +102,25 @@ func (d Def) RefName() string { return refName(d.Name, d.Ordinal) }
 
 func refName(name string, ordinal int) string { return ref.Symbol("", name, ordinal).String() }
 
+// Refs are the change's refs in the file at path: its own, and for a rename
+// the old one too.
+func (c Change) Refs(path string) []string {
+	refs := []string{ref.Symbol(path, c.Name, c.Ordinal).String()}
+	if c.What == "renamed" && c.OldName != "" {
+		refs = append(refs, ref.Symbol(path, c.OldName, c.OldOrdinal).String())
+	}
+	return refs
+}
+
+// RenameOnly reports whether a renamed symbol changed only its name: its
+// old lines, with the old name replaced by the new one, are its new lines.
+func (c Change) RenameOnly() bool {
+	return c.What == "renamed" && c.OldName != "" && len(c.OldText) > 0 && equal(renamed(c.OldText, c.OldName, c.Name), c.NewText)
+}
+
+// Ref is the definition's ref in the file at path.
+func (d Def) Ref(path string) string { return ref.Symbol(path, d.Name, d.Ordinal).String() }
+
 var (
 	lockFiles = map[string]bool{"Cargo.lock": true, "go.sum": true, "package-lock.json": true, "yarn.lock": true,
 		"pnpm-lock.yaml": true, "poetry.lock": true, "Pipfile.lock": true, "composer.lock": true, "Gemfile.lock": true,
@@ -260,11 +279,28 @@ func defs(p string, syms []outline.Symbol, lines []string) []Def {
 	return out
 }
 
-// Symbols lists a new or deleted file's top-level definitions for display.
+// Entry is one name in a new or deleted file's list of definitions.
+type Entry struct {
+	Name  string   // as printed: "func List", "func parse#2"; merged overloads by their plain name
+	Note  string   // " (public)", " (from x.go)", …, or ""
+	Count int      // definitions in it: overloads next to each other are one entry
+	Refs  []string // their refs
+}
+
+// Text is the entry as printed, with marks (" [failing]") after its name.
+func (e Entry) Text(marks string) string {
+	s := e.Name + marks + e.Note
+	if e.Count > 1 {
+		s += " ×" + itoa(e.Count)
+	}
+	return s
+}
+
+// Entries lists a new or deleted file's top-level definitions for display.
 // Overloads next to each other are one entry, under their plain name.
-func (a *File) Symbols() []string {
-	var out, plain []string
-	var count []int
+func (a *File) Entries() []Entry {
+	var out []Entry
+	var plain []string
 	for _, d := range a.Defs {
 		if !d.Top && d.From == "" && d.MovedTo == "" {
 			continue
@@ -283,14 +319,14 @@ func (a *File) Symbols() []string {
 			note = " (public)"
 		}
 		p := label(d.Kind, d.Name) + note
-		if n := len(out); n > 0 && plain[n-1] == p {
-			count[n-1]++
-			out[n-1] = p + " ×" + itoa(count[n-1]) // overloads: one entry
+		if n := len(out); n > 0 && plain[n-1] == p { // overloads: one entry
+			out[n-1].Name = label(d.Kind, d.Name)
+			out[n-1].Count++
+			out[n-1].Refs = append(out[n-1].Refs, d.Ref(a.Path))
 			continue
 		}
-		out = append(out, label(d.Kind, d.RefName())+note)
+		out = append(out, Entry{Name: label(d.Kind, d.RefName()), Note: note, Count: 1, Refs: []string{d.Ref(a.Path)}})
 		plain = append(plain, p)
-		count = append(count, 1)
 	}
 	return out
 }

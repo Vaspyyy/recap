@@ -12,6 +12,14 @@ import (
 	"testing"
 )
 
+// TestMain turns context off: the tests compare output that must depend
+// only on the arguments and the files, not on a focus or a crux run left in
+// a git dir. context_test.go turns it back on where it's tested.
+func TestMain(m *testing.M) {
+	os.Setenv("PRISM_NO_CONTEXT", "1")
+	os.Exit(m.Run())
+}
+
 // repo makes a git repository in a temp dir, chdirs into it and returns a
 // helper that writes files and commits.
 func repo(t *testing.T) (write func(name, content string), commit func(msg string)) {
