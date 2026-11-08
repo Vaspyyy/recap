@@ -8,12 +8,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -79,6 +83,8 @@ type Comparison struct {
 	Desc     string   // how the header names it, when "old → new" isn't clear
 	DiffArgs []string // the revision arguments for git diff
 	Paths    []string // pathspecs after --
+
+	special []string // working-tree paths git can't read (see File.Special), left out of git's diffs
 }
 
 func (c *Comparison) Describe() string {
@@ -208,6 +214,12 @@ type File struct {
 	OldMode    string
 	NewMode    string
 	Hunks      []Hunk
+
+	// Special is what a tracked path is in the working tree when git can't
+	// read it: "named pipe", "socket", "device" or "special file". Such a
+	// path is listed as deleted: its tracked content is gone, and git can't
+	// diff or add what's there now.
+	Special string
 }
 
 // Hunk is a run of changed lines, as git diff -U0 reports it.
@@ -221,7 +233,17 @@ type Hunk struct {
 // Files lists the changed files with their counts and hunks.
 func Files(c *Comparison) ([]*File, error) {
 	common := []string{"diff", "--no-ext-diff", "--no-textconv", "-M"}
-	out, err := Run(append(append(append(common, "--raw", "-z", "--numstat"), c.DiffArgs...), pathArgs(c.Paths)...)...)
+	out, err := Run(append(append(append(common, "--raw", "-z", "--numstat"), c.DiffArgs...), c.pathArgs()...)...)
+	var special []*File
+	if err != nil && c.New.Worktree && c.special == nil {
+		// git can't count or diff a tracked path that's now a named pipe,
+		// socket or device ("unsupported file type"): leave those out and
+		// list them as deleted
+		if special = c.findSpecial(); len(special) == 0 {
+			return nil, err
+		}
+		out, err = Run(append(append(append(common, "--raw", "-z", "--numstat"), c.DiffArgs...), c.pathArgs()...)...)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -230,13 +252,76 @@ func Files(c *Comparison) ([]*File, error) {
 		return nil, err
 	}
 	if len(files) > 0 {
-		patch, err := Run(append(append(append(common, "-U0", "--no-color"), c.DiffArgs...), pathArgs(c.Paths)...)...)
+		patch, err := Run(append(append(append(common, "-U0", "--no-color"), c.DiffArgs...), c.pathArgs()...)...)
 		if err != nil {
 			return nil, err
 		}
 		attachHunks(files, patch)
 	}
+	for _, f := range special { // in git's order: by path
+		i := sort.Search(len(files), func(i int) bool { return files[i].Path > f.Path })
+		files = slices.Insert(files, i, f)
+	}
 	return files, nil
+}
+
+// findSpecial finds the tracked paths that the working tree has as
+// something git can't read, and records them on c so its diffs leave them
+// out. git's raw listing still works for them: it only compares file
+// metadata.
+func (c *Comparison) findSpecial() []*File {
+	top, err := Toplevel()
+	if err != nil {
+		return nil
+	}
+	out, err := Run(append(append([]string{"diff", "--no-ext-diff", "--raw", "-z"}, c.DiffArgs...), c.pathArgs()...)...)
+	if err != nil {
+		return nil
+	}
+	files, err := parseRawNumstat(out)
+	if err != nil {
+		return nil
+	}
+	var special []*File
+	for _, f := range files {
+		if f.Status == 'D' {
+			continue
+		}
+		st, err := os.Lstat(filepath.Join(top, f.Path))
+		if err != nil {
+			continue
+		}
+		if kind := specialKind(st.Mode()); kind != "" {
+			special = append(special, &File{Status: 'D', Path: f.Path, OldMode: f.OldMode, NewMode: "000000", Special: kind})
+			c.special = append(c.special, f.Path)
+		}
+	}
+	return special
+}
+
+// specialKind names what a working-tree path is when git can't read it,
+// or "" for a regular file, a symlink or a directory.
+func specialKind(m fs.FileMode) string {
+	switch {
+	case m.IsRegular(), m&fs.ModeSymlink != 0, m.IsDir():
+		return ""
+	case m&fs.ModeNamedPipe != 0:
+		return "named pipe"
+	case m&fs.ModeSocket != 0:
+		return "socket"
+	case m&fs.ModeDevice != 0:
+		return "device"
+	}
+	return "special file"
+}
+
+// pathArgs are the comparison's pathspecs, without the paths git can't read.
+func (c *Comparison) pathArgs() []string {
+	args := pathArgs(c.Paths)
+	for _, p := range c.special {
+		args = append(args, ":(top,literal,exclude)"+p)
+	}
+	return args
 }
 
 func pathArgs(paths []string) []string {
@@ -292,9 +377,11 @@ var hunkRe = regexp.MustCompile(`^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@`)
 
 // attachHunks splits a -U0 patch into its per-file sections. git prints
 // them in the same order as the raw records, so sections are matched by
-// position rather than by parsing (possibly quoted) header paths.
+// position rather than by parsing (possibly quoted) header paths. A type
+// change (a file that became a symlink, or back) has two sections, the
+// old one deleted and the new one added: both belong to its record.
 func attachHunks(files []*File, patch []byte) {
-	k := -1
+	k, sections := -1, 0
 	var h *Hunk
 	sc := bufio.NewScanner(bytes.NewReader(patch))
 	sc.Buffer(make([]byte, 1<<20), 64<<20)
@@ -302,7 +389,11 @@ func attachHunks(files []*File, patch []byte) {
 	for sc.Scan() {
 		l := sc.Text()
 		if strings.HasPrefix(l, "diff --git ") || strings.HasPrefix(l, "diff --cc ") {
-			k++
+			if k >= 0 && k < len(files) && files[k].Status == 'T' && sections == 1 {
+				sections = 2
+			} else {
+				k, sections = k+1, 1
+			}
 			h = nil
 			continue
 		}
@@ -424,14 +515,47 @@ func (b *Blobs) Close() {
 	b.cmd.Wait()
 }
 
-// Content reads a file on one side of a comparison.
+// ReadWorktree reads a working-tree path the way git sees it: a regular
+// file's contents, or a symlink's target path (link is true), which is
+// never followed. Anything else (a named pipe, socket, device or
+// directory) is never opened: ok is false, as for a missing path.
+func ReadWorktree(path string) (data []byte, link, ok bool, err error) {
+	st, err := os.Lstat(path)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		return nil, false, false, nil
+	case err != nil:
+		return nil, false, false, err
+	case st.Mode()&fs.ModeSymlink != 0:
+		target, err := os.Readlink(path)
+		if err != nil {
+			return nil, false, false, err
+		}
+		return []byte(target), true, true, nil
+	case !st.Mode().IsRegular():
+		return nil, false, false, nil
+	}
+	f, err := os.OpenFile(path, os.O_RDONLY|openFlags, 0)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, syscall.ELOOP) {
+			return nil, false, false, nil // gone, or swapped for a symlink since Lstat
+		}
+		return nil, false, false, err
+	}
+	defer f.Close()
+	if st, err := f.Stat(); err != nil || !st.Mode().IsRegular() {
+		return nil, false, false, err // swapped for something else since Lstat
+	}
+	data, err = io.ReadAll(f)
+	return data, false, err == nil, err
+}
+
+// Content reads a file on one side of a comparison: in the working tree as
+// git sees it (ReadWorktree), nil for what git can't read.
 func Content(b *Blobs, top string, s Side, path string) ([]byte, error) {
 	switch {
 	case s.Worktree:
-		data, err := os.ReadFile(filepath.Join(top, path))
-		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
-		}
+		data, _, _, err := ReadWorktree(filepath.Join(top, path))
 		return data, err
 	case s.Index:
 		return b.Get(":" + path)
@@ -493,7 +617,11 @@ func FullDiff(c *Comparison, context int, color bool, paths []string) ([]byte, e
 	if len(paths) == 0 {
 		paths = c.Paths
 	}
-	return Run(append(append(args, c.DiffArgs...), pathArgs(paths)...)...)
+	pa := pathArgs(paths)
+	for _, p := range c.special { // what git can't read is listed as deleted, not diffed
+		pa = append(pa, ":(top,literal,exclude)"+p)
+	}
+	return Run(append(append(args, c.DiffArgs...), pa...)...)
 }
 
 // Conflicts lists the paths with unresolved merge conflicts.

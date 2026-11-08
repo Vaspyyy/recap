@@ -356,6 +356,11 @@ func run(args []string) int {
 				res.Notes = append(res.Notes, "merge in progress: merging "+m+"; resolve the conflicts, then commit (or git merge --abort)")
 			}
 		}
+		for _, f := range files {
+			if f.Special != "" {
+				res.Notes = append(res.Notes, f.Path+": "+render.SpecialNote(f.Special)+"; listed as deleted")
+			}
+		}
 		c.setFocus(o, comp, commit, files)
 		return c.emit(res)
 	}
@@ -481,9 +486,15 @@ func collect(top string, comp *gitx.Comparison, untracked bool) ([]*analyze.File
 				return nil, nil, err
 			}
 		}
+		if f.Special != "" { // listed as deleted: git couldn't count its lines
+			f.Binary = bytes.IndexByte(old[:min(len(old), 8000)], 0) >= 0
+		}
 		contents[f.Path] = pair{old, new}
 		a := analyze.Analyze(f, old, new, false)
 		a.Conflict = conflicts[f.Path]
+		if f.Special != "" && !f.Binary {
+			f.Deleted = a.Lines
+		}
 		files = append(files, a)
 	}
 	if untracked {
@@ -492,12 +503,17 @@ func collect(top string, comp *gitx.Comparison, untracked bool) ([]*analyze.File
 			return nil, nil, err
 		}
 		for _, p := range paths {
-			data, err := os.ReadFile(filepath.Join(top, p))
-			if err != nil {
-				continue // a socket, a broken link, a file that went away
+			// as git would add it: a symlink is its target's path, and what
+			// git can't add (a named pipe, a socket) is left out
+			data, link, ok, err := gitx.ReadWorktree(filepath.Join(top, p))
+			if err != nil || !ok {
+				continue // also a file that went away
 			}
 			f := &gitx.File{Status: '?', Path: p, Added: bytes.Count(data, []byte{'\n'})}
-			if bytes.IndexByte(data[:min(len(data), 8000)], 0) >= 0 {
+			switch {
+			case link:
+				f.NewMode, f.Added = "120000", 1
+			case bytes.IndexByte(data[:min(len(data), 8000)], 0) >= 0:
 				f.Binary, f.Added = true, 0
 			}
 			contents[p] = pair{nil, data}
@@ -515,7 +531,7 @@ func collect(top string, comp *gitx.Comparison, untracked bool) ([]*analyze.File
 func pairMoves(files []*analyze.File, contents map[string]pair) []*analyze.File {
 	used := map[*analyze.File]bool{}
 	for _, d := range files {
-		if d.Status != 'D' || len(d.Defs) < 2 {
+		if d.Status != 'D' || len(d.Defs) < 2 || d.Special != "" {
 			continue
 		}
 		var best *analyze.File

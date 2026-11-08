@@ -332,6 +332,9 @@ func status(f *analyze.File, c pal, compact bool) string {
 	if f.Conflict && f.Hunks == nil && !f.Untracked {
 		tail = append(tail, "nothing staged")
 	}
+	if f.Special != "" {
+		tail = append(tail, SpecialNote(f.Special))
+	}
 	if len(tail) == 0 {
 		return s
 	}
@@ -605,6 +608,10 @@ func (w *writer) compactLine(f *analyze.File) string {
 	}
 	return b.String()
 }
+
+// SpecialNote says what's at a tracked path git can't read: "now a named
+// pipe, which git can't diff or add".
+func SpecialNote(kind string) string { return "now a " + kind + ", which git can't diff or add" }
 
 // Rank orders files by how much a reader needs them when not all fit:
 // source with symbol changes, other source, tests, docs, data and fixtures,

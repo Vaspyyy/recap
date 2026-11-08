@@ -70,6 +70,7 @@ Paths after `--` limit everything to those files: `recap HEAD~3 -- src/`. Moves 
 - Symbols come from the outline rules shared with glint and seek (Go, Rust, Python, JS/TS, C/C++, Java, Kotlin, C#, GDScript, shell, Lua, Ruby, Markdown headings). Other files get counts only, plus the changed lines when there are only one or two.
 - `moved` (without a file) means a definition changed places among the others, unchanged. Lines inserted above a definition don't make it "moved". `(doc comment only)` and `(decorators changed)` say that only the lines above a definition changed; decorator changes can change behaviour. `--show` includes doc comments and decorators.
 - `renamed … (rewritten)` is a function at the same place with a similar name and a new body. `line endings only (LF → CRLF)` marks a line-ending change, like `(whitespace only)` above.
+- `symlink` files are compared by their target path, as git stores them (`-old/target  +new/target`). `deleted, …, now a named pipe, which git can't diff or add` is a tracked file replaced by something git can't read.
 - Under the budget (default 150 lines, `-b N`), every file gets its line first, then a share of its changes, with signature changes, renames and removals first. Cut changes are summarised by kind (`… +390 more changes: 390 changed (each +1 −1)`).
 - The header's totals are git's own (`git diff --numstat`), also when recap pairs a moved file that git saw as deleted and new.
 

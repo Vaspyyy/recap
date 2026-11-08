@@ -133,6 +133,8 @@ Text stays the default, and it's what agents should read: it says the same in fa
 
 recap compares definitions, not behaviour: it tells you that a function changed and, for small changes, which lines, but not what the change means. Definitions the outline rules don't see (Go `var` blocks, macros, configuration keys, one-line class members in JavaScript) count as lines outside definitions or as changes of the enclosing symbol. When the exact change matters, use `--show` or `git diff`.
 
+The working tree is read the way git sees it. A symlink is compared by the path it points to, as git stores it, and is never followed, so a link that changed target shows the old and new path. A tracked path that is now something git can't read (a named pipe, socket or device) is listed as deleted with a note, and an untracked one is left out, as `git status` does.
+
 ## License
 
 GPL-3.0. See [LICENSE](LICENSE).
