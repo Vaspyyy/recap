@@ -51,8 +51,8 @@ func Path(p string) string {
 	return p
 }
 
-// shellArg quotes a word for pasting into a shell.
-func shellArg(s string) string {
+// ShellArg quotes a word for pasting into a shell.
+func ShellArg(s string) string {
 	if strings.IndexFunc(s, func(r rune) bool {
 		return !(unicode.IsLetter(r) || unicode.IsDigit(r) || strings.ContainsRune("-_./:=@%+,", r))
 	}) < 0 {
@@ -308,7 +308,7 @@ func (w *writer) file(f *analyze.File, changes []analyze.Change, quota int, ind 
 		topShown = true
 	}
 	if rest := changes[shown:]; len(rest) > 0 {
-		w.line("%s  %s… +%s (recap --show %s:<name>, or raise -b)%s", ind, c.faint, summarize(rest), shellArg(f.Path), c.reset)
+		w.line("%s  %s… +%s (recap --show %s:<name>, or raise -b)%s", ind, c.faint, summarize(rest), ShellArg(f.Path), c.reset)
 	} else if !topShown && f.TopReal && len(f.Changes) > 0 {
 		w.line("%s  %s… and lines outside definitions %s%s", ind, c.faint, Counts(f.TopPlus, f.TopMinus, pal{}), c.reset)
 	}
@@ -343,9 +343,9 @@ func summarize(rest []analyze.Change) string {
 func (w *writer) change(ch analyze.Change, ind string, withDetail bool) {
 	c := w.c
 	color := map[string]string{"changed": c.yellow, "added": c.green, "removed": c.red, "renamed": c.blue, "moved": c.blue}[ch.What]
-	name := Label(ch.Kind, ch.Name)
+	name := Label(ch.Kind, ch.RefName())
 	if ch.What == "renamed" {
-		name = Label(ch.Kind, ch.OldName) + " → " + ch.Name
+		name = Label(ch.Kind, ch.OldRefName()) + " → " + ch.RefName()
 	}
 	where := "L" + span(ch.Line, ch.End)
 	if ch.What == "removed" {
@@ -457,17 +457,16 @@ func compactLine(f *analyze.File, c pal) string {
 	var groups []string
 	for _, what := range []string{"changed", "renamed", "moved", "added", "removed"} {
 		var names []string
-		seen := map[string]bool{}
 		for _, ch := range f.Changes {
 			if ch.What != what {
 				continue
 			}
-			n := ch.Name
+			n := ch.RefName()
 			if strings.HasPrefix(ch.Kind, "h") && len(ch.Kind) == 2 {
-				n = Label(ch.Kind, ch.Name)
+				n = Label(ch.Kind, ch.RefName())
 			}
 			if what == "renamed" {
-				n = ch.OldName + " → " + ch.Name
+				n = ch.OldRefName() + " → " + ch.RefName()
 			}
 			var notes []string
 			if ch.OldSig != "" {
@@ -487,11 +486,7 @@ func compactLine(f *analyze.File, c pal) string {
 			if len(notes) > 0 {
 				n += " (" + strings.Join(notes, ", ") + ")"
 			}
-			if seen[n] { // a Rust struct and its impl block share a name
-				continue
-			}
-			seen[n] = true
-			names = append(names, n)
+			names = append(names, n) // a Rust struct and its impl block differ by "#N"
 		}
 		if len(names) > 6 {
 			names = append(names[:6], fmt.Sprintf("+%d more", len(names)-6))

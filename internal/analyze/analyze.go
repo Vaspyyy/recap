@@ -12,6 +12,7 @@ import (
 	"unicode"
 
 	"github.com/Vaspyyy/prism/outline"
+	"github.com/Vaspyyy/prism/ref"
 	"github.com/Vaspyyy/recap/internal/gitx"
 )
 
@@ -31,6 +32,11 @@ type Change struct {
 	NewSig  string
 	Members int // added and removed classes and the like: symbols inside
 
+	// Ordinal is N in "name#N" when the file has more than one definition by
+	// that name (ref.Ordinals over its whole outline, the old version's for
+	// a removed symbol), else 0. OldOrdinal is the same for OldName.
+	Ordinal, OldOrdinal int
+
 	From     string // added: the symbol in this file whose body it took (an extracted function)
 	FromFile string // added: the file it moved from
 	MovedTo  string // removed: the file it moved to
@@ -48,6 +54,7 @@ type Def struct {
 	Kind, Name string
 	Line, End  int
 	Sig        string
+	Ordinal    int    // N in "name#N" when the file has more than one definition by that name
 	Top        bool   // listed on the file's line (top level; for Markdown also ## sections)
 	From       string // new files: the file it was removed from
 	MovedTo    string // deleted files: the file it went to
@@ -77,7 +84,23 @@ type File struct {
 	LineEndings string     // "LF → CRLF" when that is all that changed
 	PairedFrom  *gitx.File // a deleted file git didn't see as this one's old name
 	PairedNew   *gitx.File // and the new file as git saw it
+
+	// the outlines of both versions (empty for a missing side), so refs can
+	// name any definition: "#N" counts all of them, changed or not
+	OldSyms, NewSyms []outline.Symbol
 }
+
+// RefName is the change's name as printed: its qualified name, with "#N"
+// when the file has more than one definition by that name.
+func (c Change) RefName() string { return refName(c.Name, c.Ordinal) }
+
+// OldRefName is RefName for the name before a rename.
+func (c Change) OldRefName() string { return refName(c.OldName, c.OldOrdinal) }
+
+// RefName is the definition's name as printed (see Change.RefName).
+func (d Def) RefName() string { return refName(d.Name, d.Ordinal) }
+
+func refName(name string, ordinal int) string { return ref.Symbol("", name, ordinal).String() }
 
 var (
 	lockFiles = map[string]bool{"Cargo.lock": true, "go.sum": true, "package-lock.json": true, "yarn.lock": true,
@@ -136,6 +159,7 @@ func Analyze(f *gitx.File, old, new []byte, untracked bool) *File {
 	}
 	oldSyms := outline.Parse(oldPath, old, 5000)
 	newSyms := outline.Parse(f.Path, new, 5000)
+	a.OldSyms, a.NewSyms = oldSyms, newSyms
 	switch {
 	case f.Status == 'A' || untracked:
 		a.Defs = defs(f.Path, newSyms, splitLines(new))
@@ -227,56 +251,48 @@ func text(lines []string, s outline.Symbol) []string {
 
 func defs(p string, syms []outline.Symbol, lines []string) []Def {
 	var out []Def
+	ords := ref.Ordinals(ref.Targets(p, syms))
 	for i, s := range syms {
 		top := s.Parent < 0 || (s.Kind == "h2" && syms[s.Parent].Kind == "h1")
-		out = append(out, Def{Kind: s.Kind, Name: outline.Qualified(syms, i), Line: s.Line, End: s.End, Sig: fullSig(lines, s), Top: top,
-			Public: public(p, syms, i), Text: text(lines, s)})
+		out = append(out, Def{Kind: s.Kind, Name: outline.Qualified(syms, i), Ordinal: ords[i], Line: s.Line, End: s.End, Sig: fullSig(lines, s),
+			Top: top, Public: public(p, syms, i), Text: text(lines, s)})
 	}
 	return out
 }
 
 // Symbols lists a new or deleted file's top-level definitions for display.
+// Overloads next to each other are one entry, under their plain name.
 func (a *File) Symbols() []string {
-	var out []string
+	var out, plain []string
+	var count []int
 	for _, d := range a.Defs {
 		if !d.Top && d.From == "" && d.MovedTo == "" {
 			continue
 		}
-		l := label(d.Kind, d.Name)
+		note := ""
 		switch {
 		case d.From != "" && d.OldSig != "":
-			l += " (from " + d.From + ", signature changed)"
+			note = " (from " + d.From + ", signature changed)"
 		case d.From != "" && d.Differs > 0:
-			l += " (from " + d.From + ", " + lines(d.Differs) + ")"
+			note = " (from " + d.From + ", " + lines(d.Differs) + ")"
 		case d.From != "":
-			l += " (from " + d.From + ")"
+			note = " (from " + d.From + ")"
 		case d.MovedTo != "":
-			l += " (moved to " + d.MovedTo + ")"
+			note = " (moved to " + d.MovedTo + ")"
 		case a.Status == 'D' && d.Public:
-			l += " (public)"
+			note = " (public)"
 		}
-		if n := len(out); n > 0 && (out[n-1] == l || strings.HasPrefix(out[n-1], l+" ×")) {
-			k := 2
-			if i := strings.LastIndex(out[n-1], " ×"); i > 0 && strings.HasPrefix(out[n-1], l+" ×") {
-				k = atoiSafe(out[n-1][i+len(" ×"):]) + 1
-			}
-			out[n-1] = l + " ×" + itoa(k) // overloads: one entry
+		p := label(d.Kind, d.Name) + note
+		if n := len(out); n > 0 && plain[n-1] == p {
+			count[n-1]++
+			out[n-1] = p + " ×" + itoa(count[n-1]) // overloads: one entry
 			continue
 		}
-		out = append(out, l)
+		out = append(out, label(d.Kind, d.RefName())+note)
+		plain = append(plain, p)
+		count = append(count, 1)
 	}
 	return out
-}
-
-func atoiSafe(s string) int {
-	n := 0
-	for _, c := range s {
-		if c < '0' || c > '9' {
-			break
-		}
-		n = n*10 + int(c-'0')
-	}
-	return n
 }
 
 func label(kind, name string) string {
@@ -388,6 +404,7 @@ func hasChildren(syms []outline.Symbol, i int) bool {
 
 func (a *File) compare(oldSyms, newSyms []outline.Symbol, oldLines, newLines []string) {
 	oldOwn, newOwn := owners(oldSyms, oldLines), owners(newSyms, newLines)
+	oldOrd, newOrd := ref.Ordinals(ref.Targets(a.oldPath(), oldSyms)), ref.Ordinals(ref.Targets(a.Path, newSyms))
 	minus := make([]int, len(oldSyms))
 	plus := make([]int, len(newSyms))
 	real := make([]bool, len(newSyms)) // a non-blank line changed in its own lines
@@ -491,7 +508,7 @@ func (a *File) compare(oldSyms, newSyms []outline.Symbol, oldLines, newLines []s
 		oa, _ := attribution(oldLines, os)
 		na, _ := attribution(newLines, ns)
 		oat, nat := oldLines[oa-1:min(len(oldLines), os.End)], newLines[na-1:min(len(newLines), ns.End)]
-		c := Change{What: "changed", Kind: ns.Kind, Name: outline.Qualified(newSyms, j), Line: ns.Line, End: ns.End,
+		c := Change{What: "changed", Kind: ns.Kind, Name: outline.Qualified(newSyms, j), Ordinal: newOrd[j], Line: ns.Line, End: ns.End,
 			OldLine: os.Line, OldEnd: os.End, Plus: plus[j], Minus: minus[o], OldText: oat, NewText: nat,
 			Public: public(a.Path, newSyms, j) || public(a.oldPath(), oldSyms, o)}
 		if !hasChildren(newSyms, j) && !hasChildren(oldSyms, o) {
@@ -581,6 +598,7 @@ func (a *File) compare(oldSyms, newSyms []outline.Symbol, oldLines, newLines []s
 		ns := newSyms[best]
 		nt := text(newLines, ns)
 		c := Change{What: "renamed", Kind: ns.Kind, Name: outline.Qualified(newSyms, best), OldName: outline.Qualified(oldSyms, i),
+			Ordinal: newOrd[best], OldOrdinal: oldOrd[i],
 			Line: ns.Line, End: ns.End, OldLine: os.Line, OldEnd: os.End, OldText: ot, NewText: nt, Note: note,
 			Public: public(a.oldPath(), oldSyms, i)}
 		if ops := LineDiff(renamed(ot, os.Name, ns.Name), nt); ops != nil {
@@ -597,7 +615,7 @@ func (a *File) compare(oldSyms, newSyms []outline.Symbol, oldLines, newLines []s
 		}
 		s := newSyms[j]
 		nt := text(newLines, s)
-		c := Change{What: "added", Kind: s.Kind, Name: outline.Qualified(newSyms, j), Line: s.Line, End: s.End,
+		c := Change{What: "added", Kind: s.Kind, Name: outline.Qualified(newSyms, j), Ordinal: newOrd[j], Line: s.Line, End: s.End,
 			Members: members(newSyms, j), NewText: nt, Public: public(a.Path, newSyms, j)}
 		if s.Parent >= 0 && newSyms[s.Parent].Kind == "trait" && len(nt) == 1 && strings.HasSuffix(strings.TrimSpace(nt[0]), ";") {
 			c.Note = "required: every implementation must add it"
@@ -627,7 +645,7 @@ func (a *File) compare(oldSyms, newSyms []outline.Symbol, oldLines, newLines []s
 	}
 	for _, i := range keptRemoved {
 		s := oldSyms[i]
-		a.Changes = append(a.Changes, Change{What: "removed", Kind: s.Kind, Name: outline.Qualified(oldSyms, i), Line: s.Line, End: s.End,
+		a.Changes = append(a.Changes, Change{What: "removed", Kind: s.Kind, Name: outline.Qualified(oldSyms, i), Ordinal: oldOrd[i], Line: s.Line, End: s.End,
 			OldLine: s.Line, OldEnd: s.End, Members: members(oldSyms, i), OldText: text(oldLines, s), Public: public(a.oldPath(), oldSyms, i)})
 	}
 	order := map[string]int{"changed": 0, "renamed": 1, "moved": 2, "added": 3, "removed": 4}

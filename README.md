@@ -40,6 +40,19 @@ recap takes the same kinds of arguments as `git diff`:
 
 Paths after `--` limit any of them to those files. `--show TARGET` prints the diff of the changed symbols matching `file:name`, `name` or a file; `-p` prints git's full patch after the overview; `-b N` sets roughly how many lines the overview may use (150 by default); `-A` gives plain output without colors, which is the default when stdout isn't a terminal.
 
+`--show` takes any [ref](#refs). A location such as `internal/group/group.go:312`, as compilers, test runners and crux print it, shows the changed symbol containing that line (line numbers of the new version); if the line's symbol didn't change, recap says so and lists what did. `main.go:run@b681ef1` is the same as `recap show b681ef1 --show main.go:run`. A name finds the symbol with exactly that qualified name, else the ones ending in it (`area` finds `Circle.area`), and a class or type name shows its changed members.
+
+## Refs
+
+glint, seek, recap and crux name files, symbols and locations the same way, so anything one of them prints can be handed to another as is:
+
+- `internal/files/files.go`: a file
+- `internal/files/files.go:List`: a symbol, by its qualified name (`Repo.Open` for a method, `outer.inner` for a nested function)
+- `internal/files/files.go:73`: a line (`73:5` with a column, `73-107` a range); tools that take a symbol use the innermost one containing it
+- `main.go:run@b681ef1`: a symbol as it was in a commit; `lib.cpp:parse#2`: the second of two definitions with the same name
+
+Paths are relative to the repository root. The format is specified in [Prism](https://github.com/Vaspyyy/prism/blob/main/docs/refs.md).
+
 ## What it reports
 
 Every changed file gets one line with its status (modified, new, deleted, renamed, untracked, binary, lock file, generated, minified, a merge conflict) and its added and removed lines, which are git's own numbers. Below it comes one line per changed symbol:
@@ -59,6 +72,8 @@ money.go  modified, +11 −27
            + return (c*bp + 5000) / 10000
   also     imports  +2 −2 (3 blank): +"fmt"
 ```
+
+Each symbol line's name, after the file's path and a `:`, is a ref for `--show` (or for glint, seek and crux): `money.go:Format` above. A name that appears more than once in a file gets `#2`, `#3` and so on, counted over all of the file's definitions.
 
 Symbols are matched between the old and new version by kind and name, so a function that changed keeps its identity. recap also follows code that moved: a definition that left one file and appeared in another is reported as a move, with whether it changed on the way, and a deleted file that reappears elsewhere with the same definitions is paired with it even when git saw a delete and a new file. A new function whose body came from an existing one, as when a helper is extracted, says so and shows the lines that differ, which is where a change hidden in a refactor usually sits. Renames are found when the body stayed the same or when a function was rewritten in place under a similar name.
 

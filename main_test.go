@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -43,15 +44,32 @@ func repo(t *testing.T) (write func(name, content string), commit func(msg strin
 // recap runs the tool in-process and returns stdout and the exit code.
 func recap(t *testing.T, args ...string) (string, int) {
 	t.Helper()
-	r, w, _ := os.Pipe()
-	old := os.Stdout
-	os.Stdout = w
-	code := run(append([]string{"-A"}, args...))
-	w.Close()
-	os.Stdout = old
-	var b bytes.Buffer
-	b.ReadFrom(bufio.NewReader(r))
-	return b.String(), code
+	out, _, code := recapAll(t, args...)
+	return out, code
+}
+
+// recapAll is recap that also returns what went to stderr.
+func recapAll(t *testing.T, args ...string) (stdout, stderr string, code int) {
+	t.Helper()
+	capture := func(f **os.File) func() string {
+		r, w, _ := os.Pipe()
+		old := *f
+		*f = w
+		done := make(chan string)
+		go func() {
+			var b bytes.Buffer
+			b.ReadFrom(bufio.NewReader(r))
+			done <- b.String()
+		}()
+		return func() string {
+			w.Close()
+			*f = old
+			return <-done
+		}
+	}
+	out, errs := capture(&os.Stdout), capture(&os.Stderr)
+	code = run(append([]string{"-A"}, args...))
+	return out(), errs(), code
 }
 
 const gpuV1 = `
@@ -267,6 +285,10 @@ func compare(a, b string) int {
 	if !strings.Contains(out, "was: export function fetchUser(id: number)") {
 		t.Errorf("signature change inside the moved file missing:\n%s", out)
 	}
+	// the old path names the moved file too
+	if out, _ = recap(t, "HEAD~1", "HEAD", "--show", "api.ts:fetchUser"); !strings.HasPrefix(out, "changed function fetchUser  (net/client.ts L1-3)\n") {
+		t.Errorf("--show api.ts:fetchUser (the old path):\n%s", out)
+	}
 }
 
 func TestConflictsWhitespaceAndCounts(t *testing.T) {
@@ -416,7 +438,7 @@ func TestSecondRoundRegressions(t *testing.T) {
 		"- (x * 100.0).round() / 100.0",
 		"+ (x * 100.0 + 1e-9).round() / 100.0",
 		"added    fn Shape.name  L3  (public; required: every implementation must add it)",
-		"added    function over  L2",
+		"added    function over#2  L2", // the second of three definitions named over
 		"was: export default function main(a: number, b: string): void",
 	} {
 		if !strings.Contains(out, want) {
@@ -427,6 +449,9 @@ func TestSecondRoundRegressions(t *testing.T) {
 		if strings.Contains(out, bad) {
 			t.Errorf("should not contain %q:\n%s", bad, out)
 		}
+	}
+	if out, _ := recap(t, "--show", "a.ts:over#2"); !strings.HasPrefix(out, "added function over#2  (a.ts L2)\n+function over(a: boolean): boolean;") {
+		t.Errorf("--show a.ts:over#2:\n%s", out)
 	}
 	// --staged with a range, --show with an empty name, a miss on a clean tree
 	if _, code := recap(t, "--staged", "HEAD~1..HEAD"); code != 2 {
@@ -515,21 +540,40 @@ func TestFinalRoundRegressions(t *testing.T) {
 	}
 }
 
+// Paths in refs are read from the repository root first, as recap prints
+// them, then from the working directory, then as a unique suffix.
 func TestShowFromASubdirectory(t *testing.T) {
 	write, commit := repo(t)
 	write("sub/h.py", "def helper():\n    return 1\n")
 	write("h.py", "def helper():\n    return 1\n")
+	write("sub/only.py", "def only():\n    return 1\n")
 	commit("first")
 	write("sub/h.py", "def helper():\n    return 2\n")
 	write("h.py", "def helper():\n    return 3\n")
+	write("sub/only.py", "def only():\n    return 4\n")
+	root, _ := recap(t)
 	os.Chdir("sub")
+	if here, _ := recap(t); here != root || !strings.Contains(here, "\nsub/h.py  modified") {
+		t.Errorf("paths must be printed relative to the root, also from sub/:\n%s\nvs from the root:\n%s", here, root)
+	}
 	out, _ := recap(t, "--show", "h.py:helper")
-	if !strings.Contains(out, "+    return 2") || strings.Contains(out, "return 3") {
-		t.Errorf("h.py from sub/ is sub/h.py:\n%s", out)
+	if !strings.Contains(out, "+    return 3") || strings.Contains(out, "return 2") ||
+		!strings.HasPrefix(out, "note: h.py is the file at the repository root (recap reads paths from there, as it prints them); sub/h.py, relative to here, changed too\n") {
+		t.Errorf("h.py from sub/ is the h.py recap prints, with a note on sub/h.py:\n%s", out)
+	}
+	for _, args := range [][]string{{"--show", "sub/h.py:helper"}, {"--show", "./sub/h.py:3-1"}} {
+		if out, _ := recap(t, args...); !strings.Contains(out, "+    return 2") || strings.Contains(out, "note:") {
+			t.Errorf("recap %v from sub/:\n%s", args, out)
+		}
 	}
 	out, _ = recap(t, "--show", "../h.py:helper")
 	if !strings.Contains(out, "+    return 3") {
 		t.Errorf("../h.py from sub/ is h.py:\n%s", out)
+	}
+	for _, target := range []string{"only.py:only", "sub/only.py:only", "only.py:1", "only.py"} {
+		if out, code := recap(t, "--show", target); code != 0 || !strings.Contains(out, "+    return 4") {
+			t.Errorf("--show %s from sub/ (relative to here): exit %d\n%s", target, code, out)
+		}
 	}
 }
 
@@ -565,5 +609,188 @@ func TestHelpColorsOnlyWhenAsked(t *testing.T) {
 	}
 	if colored := helpText(true); !strings.Contains(colored, hSection+"USAGE"+hReset) {
 		t.Errorf("colored help has no colored section titles:\n%s", colored)
+	}
+}
+
+const groupV1 = `
+package group
+
+type Group struct{ n int }
+
+func (g *Group) Add(x int) {
+	g.n += x
+}
+
+func (g *Group) Count() int {
+	return g.n
+}
+
+func Helper() int {
+	return 1
+}
+
+func (g *Group) Reset() {
+	g.n = 0
+}
+`
+
+// refsRepo commits a first version and a second one of a few files, for
+// refs: duplicates, impl members, nested functions, a rename, a deleted file.
+func refsRepo(t *testing.T) {
+	write, commit := repo(t)
+	write("internal/group/group.go", groupV1)
+	write("lib.cpp", "int parse(int a) {\n  return a;\n}\nint parse(double a) {\n  return 0;\n}\nint Foo::baz() {\n  return 2;\n}\n")
+	write("shape.rs", "pub struct Circle {\n    pub r: f64,\n}\n\nimpl Circle {\n    pub fn area(&self) -> f64 {\n        1.0\n    }\n}\n\nimpl Shape for Circle {\n    fn name(&self) -> String {\n        \"c\".into()\n    }\n}\n")
+	write("nest.py", "def outer():\n    def inner():\n        return 1\n    return inner\n")
+	write("legacy.go", "package old\n\nfunc Gone() int {\n\treturn 1\n}\n\nfunc Other() int {\n\treturn 2\n}\n")
+	write("README.md", "# demo\n\n## Contact @me\n\nmail\n")
+	commit("first")
+	g := strings.Replace(strings.Replace(groupV1, "g.n += x", "g.n += x * 2", 1), "return 1", "return 2", 1)
+	write("internal/group/group.go", strings.Replace(g, "Count()", "Size()", 1))
+	write("lib.cpp", "int parse(int a) {\n  return a;\n}\nint parse(double a) {\n  return 1;\n}\nint Foo::baz() {\n  return 3;\n}\n")
+	write("shape.rs", "pub struct Circle {\n    pub r: f64,\n}\n\nimpl Circle {\n    pub fn area(&self) -> f64 {\n        3.14\n    }\n}\n\nimpl Shape for Circle {\n    fn name(&self) -> String {\n        \"c\".into()\n    }\n}\n")
+	write("nest.py", "def outer():\n    def inner():\n        return 2\n    return inner\n\n\ndef fresh():\n    def helper():\n        return 1\n    return helper\n")
+	os.Remove("legacy.go")
+	write("README.md", "# demo\n\n## Contact @me\n\nmail me\n")
+	commit("second")
+}
+
+var changeLineRe = regexp.MustCompile(`^  (?:changed|added|removed|renamed|moved) +\S+ (.+?)  (?:was )?L\d`)
+
+// Every symbol in the overview, its file's header path + ":" + its name as
+// shown, is a ref --show accepts, also with @rev and from a subdirectory.
+func TestOverviewPrintsRefs(t *testing.T) {
+	refsRepo(t)
+	out, _ := recap(t, "HEAD~1", "HEAD")
+	for _, want := range []string{
+		"changed  func Group.Add  L5-7",
+		"renamed  func Group.Count → Group.Size  L9-11",
+		"changed  func parse#2  L4-6",
+		"changed  func Foo::baz  L7-9",
+		"changed  fn Circle.area  L6-8",
+		"changed  def outer.inner  L2-3",
+		"added    def fresh  L7-10  (public; with 1 inside)",
+		"changed  ## Contact @me  L3-5",
+		"legacy.go  deleted, 9 lines: func Gone (public), func Other (public)",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in\n%s", want, out)
+		}
+	}
+	var path string
+	var refs []string
+	for _, l := range strings.Split(out, "\n") {
+		if l != "" && l[0] != ' ' && !strings.HasPrefix(l, "recap:") {
+			path, _, _ = strings.Cut(l, "  ")
+		} else if m := changeLineRe.FindStringSubmatch(l); m != nil {
+			for _, name := range strings.Split(m[1], " → ") {
+				refs = append(refs, path+":"+name)
+			}
+		}
+	}
+	if len(refs) != 10 {
+		t.Fatalf("expected 10 refs (a rename has two), got %q from\n%s", refs, out)
+	}
+	check := func(where string, args ...string) {
+		t.Helper()
+		target := args[len(args)-1]
+		name := target[strings.IndexByte(target, ':')+1:]
+		name = strings.TrimSuffix(name, "@HEAD")
+		if out, code := recap(t, args...); code != 0 || strings.Contains(out, "matches for") || !strings.Contains(strings.SplitN(out, "\n", 2)[0], " "+name) {
+			t.Errorf("%s: recap %v: exit %d\n%s", where, args, code, out)
+		}
+	}
+	for _, r := range refs {
+		check("from the root", "HEAD~1", "HEAD", "--show", r)
+		check("from the root", "--show", r+"@HEAD")
+	}
+	os.Chdir("internal")
+	if here, _ := recap(t, "HEAD~1", "HEAD"); here != out {
+		t.Errorf("paths must be printed relative to the root, also from internal/:\n%s", here)
+	}
+	for _, r := range refs {
+		check("from internal/", "--show", r+"@HEAD")
+	}
+	// relative to here, and a unique suffix
+	for _, target := range []string{"group/group.go:Helper@HEAD", "group.go:Helper@HEAD", "group.go:14@HEAD"} {
+		if out, code := recap(t, "--show", target); code != 0 || !strings.HasPrefix(out, "changed func Helper  (internal/group/group.go L13-15)\n") {
+			t.Errorf("--show %s from internal/: exit %d\n%s", target, code, out)
+		}
+	}
+}
+
+func TestShowRefs(t *testing.T) {
+	refsRepo(t)
+	for _, c := range []struct {
+		target string
+		want   []string // the first line, then other lines that must be there
+	}{
+		// a location: the changed symbol containing the line, in the new version
+		{"internal/group/group.go:6", []string{"changed func Group.Add  (internal/group/group.go L5-7)", "+\tg.n += x * 2"}},
+		{"internal/group/group.go:6:3", []string{"changed func Group.Add  (internal/group/group.go L5-7)"}},
+		{"internal/group/group.go:5-7", []string{"changed func Group.Add  (internal/group/group.go L5-7)"}},
+		{"internal/group/group.go:10", []string{"renamed func Group.Count → Group.Size  (internal/group/group.go L9-11)"}},
+		// inside a nested function of an added one: the added one
+		{"nest.py:9", []string{"added def fresh  (nest.py L7-10)", "+    def helper():"}},
+		// a deleted file only has its old lines
+		{"legacy.go:8", []string{"removed func Other  (legacy.go, was L7-9)", "-\treturn 2"}},
+		{"legacy.go:Gone", []string{"removed func Gone  (legacy.go, was L3-5)"}},
+		// duplicates: the overview's "#N", counted over every definition
+		{"lib.cpp:parse#2", []string{"changed func parse#2  (lib.cpp L4-6)", "+  return 1;"}},
+		{"parse", []string{"changed func parse#2  (lib.cpp L4-6)"}},
+		// a name with ':' in it, without a path
+		{"Foo::baz", []string{"changed func Foo::baz  (lib.cpp L7-9)"}},
+		// a name ending in the given one at a '.'; a type shows its changed members
+		{"area", []string{"changed fn Circle.area  (shape.rs L6-8)"}},
+		{"shape.rs:Circle", []string{"changed fn Circle.area  (shape.rs L6-8)"}},
+		{"inner", []string{"changed def outer.inner  (nest.py L2-3)"}},
+		// an '@' that isn't a revision is part of the name
+		{"README.md:Contact @me", []string{"changed ## Contact @me  (README.md L3-5)"}},
+	} {
+		out, code := recap(t, "HEAD~1", "HEAD", "--show", c.target)
+		first, _, _ := strings.Cut(out, "\n")
+		if code != 0 || first != c.want[0] {
+			t.Errorf("--show %s: exit %d, want first line %q:\n%s", c.target, code, c.want[0], out)
+			continue
+		}
+		for _, w := range c.want[1:] {
+			if !strings.Contains(out, w) {
+				t.Errorf("--show %s: missing %q in\n%s", c.target, w, out)
+			}
+		}
+	}
+	// the new version of a file in a commit: impl blocks count with their type
+	out, _ := recap(t, "show", "HEAD~1")
+	if !strings.Contains(out, "shape.rs  new, 15 lines: struct Circle, impl Circle#2, impl Shape for Circle") {
+		t.Errorf("an impl shares its type's name:\n%s", out)
+	}
+	if out, _ = recap(t, "--show", "shape.rs:Circle#2@HEAD~1"); !strings.HasPrefix(out, "added impl Circle#2  (shape.rs L5-9)\n") {
+		t.Errorf("--show shape.rs:Circle#2@HEAD~1:\n%s", out)
+	}
+	// misses say what is there, as refs
+	for _, c := range []struct{ target, want string }{
+		{"internal/group/group.go:18", "recap: internal/group/group.go:18 is in internal/group/group.go:Group.Reset (L17-19), which didn't change in HEAD~1 → HEAD; " +
+			"changed in internal/group/group.go: internal/group/group.go:Group.Add, internal/group/group.go:Helper, internal/group/group.go:Group.Size\n"},
+		{"internal/group/group.go:2", "recap: internal/group/group.go:2 isn't inside a symbol; changed in internal/group/group.go: "},
+		{"internal/group/group.go:99", "recap: internal/group/group.go:99 is past the end of internal/group/group.go (19 lines); "},
+		{"lib.cpp:parse#1", "recap: no changed symbol matches \"lib.cpp:parse#1\"; changed: lib.cpp:parse#2, lib.cpp:Foo::baz\n"},
+		{"Nope", "recap: no changed symbol matches \"Nope\"; changed: README.md:Contact @me, internal/group/group.go:Group.Add, " +
+			"internal/group/group.go:Helper, internal/group/group.go:Group.Size, legacy.go:Gone, legacy.go:Other, lib.cpp:parse#2, lib.cpp:Foo::baz, " +
+			"nest.py:outer.inner, nest.py:fresh, shape.rs:Circle.area\n"},
+		{"nope.go:12", "recap: no changed file matches \"nope.go\" in HEAD~1 → HEAD; changed: README.md:Contact @me, internal/group/group.go:Group.Add, "},
+		{"internal/group/group.go@HEAD~1", "recap: --show internal/group/group.go@HEAD~1 means recap show HEAD~1 --show internal/group/group.go, " +
+			"which can't be combined with HEAD~1 HEAD; drop one of them\n"},
+	} {
+		if out, errs, code := recapAll(t, "HEAD~1", "HEAD", "--show", c.target); code != 2 || out != "" || !strings.HasPrefix(errs, c.want) {
+			t.Errorf("--show %s: exit %d, stdout %q, want stderr starting with\n%s\ngot\n%s", c.target, code, out, c.want, errs)
+		}
+	}
+	// @rev is "recap show rev": the same commit is fine, another one isn't
+	if out, _ := recap(t, "show", "HEAD", "--show", "parse@HEAD"); !strings.HasPrefix(out, "changed func parse#2") {
+		t.Errorf("recap show HEAD --show parse@HEAD:\n%s", out)
+	}
+	if _, errs, code := recapAll(t, "show", "HEAD~1", "--show", "parse@HEAD"); code != 2 ||
+		errs != "recap: --show parse@HEAD is about commit HEAD, but recap show was given HEAD~1; give one commit (recap show HEAD --show parse)\n" {
+		t.Errorf("two commits: exit %d, %s", code, errs)
 	}
 }
