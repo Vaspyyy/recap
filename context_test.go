@@ -8,7 +8,9 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/Vaspyyy/prism/focus"
 	prismrepo "github.com/Vaspyyy/prism/repo"
@@ -582,5 +584,45 @@ func TestNextLines(t *testing.T) {
 	write("lib.go", strings.Replace(gitOut(t, "show", "HEAD:lib.go")+"\n", "func Dispatch(ctx *Context) {\n\tctx.n++\n}\n", "", 1))
 	if out, _ := recap(t); len(nextLines(out)) != 0 || !strings.Contains(out, "removed  func Dispatch") {
 		t.Errorf("only a removal: no next: lines\n%s", out)
+	}
+}
+
+// The seek suggestion checks the working tree's copy of a file, which can
+// be anything by now: only a regular file is read, never what a symlink
+// points to (a device that never ends, a file outside the repository).
+func TestNextReadsOnlyRegularFiles(t *testing.T) {
+	id := filesRepo(t)
+	outside := filepath.Join(t.TempDir(), "files.go")
+	os.WriteFile(outside, []byte(gitOut(t, "show", "HEAD:internal/files/files.go")+"\n"), 0o644)
+	fifo := filepath.Join(t.TempDir(), "fifo")
+	if err := syscall.Mkfifo(fifo, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// a FIFO first: reading it blocks without using memory, and the test
+	// can end the read; /dev/zero would fill memory until killed
+	for _, target := range []string{fifo, os.DevNull, "/dev/zero", outside} {
+		os.Remove("internal/files/files.go")
+		if err := os.Symlink(target, "internal/files/files.go"); err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan string, 1)
+		go func() {
+			out, _ := recap(t, "show", id)
+			done <- out
+		}()
+		select {
+		case out := <-done:
+			if what := overviewRefs(out)["internal/files/files.go:List"]; what != "changed" || len(nextLines(out)) != 0 {
+				t.Errorf("files.go is a symlink to %s: List is listed (%q) but not suggested:\n%s", target, what, out)
+			}
+		case <-time.After(20 * time.Second):
+			if target == fifo {
+				if w, err := os.OpenFile(fifo, os.O_WRONLY, 0); err == nil {
+					w.Close() // the reader gets EOF and the run ends
+				}
+				<-done
+			}
+			t.Fatalf("recap show hangs when files.go is a symlink to %s", target)
+		}
 	}
 }

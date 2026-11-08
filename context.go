@@ -2,7 +2,6 @@ package main
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -395,11 +394,13 @@ func size(ch analyze.Change) int {
 }
 
 // inWorktree reports whether the working tree's copy of path has a symbol
-// with exactly the ref r. have caches each file's refs.
+// with exactly the ref r. Only a regular file is read (outline.Read): the
+// path may be a symlink by now, to a device or out of the repository.
+// have caches each file's refs.
 func inWorktree(top, path, r string, have map[string][]string) bool {
 	refs, ok := have[path]
 	if !ok {
-		if data, err := os.ReadFile(filepath.Join(top, path)); err == nil {
+		if data, ok := outline.Read(filepath.Join(top, path)); ok {
 			for _, x := range ref.Refs(ref.Targets(path, outline.Parse(path, data, 5000))) {
 				refs = append(refs, x.String())
 			}
