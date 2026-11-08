@@ -25,7 +25,7 @@ import (
 	"github.com/Vaspyyy/recap/internal/render"
 )
 
-const version = "0.3.0"
+const version = "0.4.0"
 
 type opts struct {
 	staged, patch, agent, noUntracked bool
