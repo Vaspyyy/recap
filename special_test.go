@@ -77,7 +77,11 @@ func TestSpecialFiles(t *testing.T) {
 	outside := t.TempDir()
 	pipe := filepath.Join(outside, "pipe")
 	mkfifo(t, pipe)
-	pipes := []string{pipe, "b.txt", "upipe"}
+	// a pipe in the repository too, for a short link target: the overview
+	// clips inline lines at 80 characters, and macOS's temp paths are long
+	// (an untracked pipe isn't listed, as git doesn't list it)
+	mkfifo(t, "p")
+	pipes := []string{pipe, "p", "b.txt", "upipe"}
 
 	// named pipes first, one case at a time: a regression blocks on them
 	// (and the test stops) instead of filling memory on /dev/zero below
@@ -86,9 +90,9 @@ func TestSpecialFiles(t *testing.T) {
 	if code != 0 || !strings.HasSuffix(out, "\nulink  untracked, 1 line, symlink\n") {
 		t.Errorf("an untracked symlink is its target's path: exit %d\n%s", code, out)
 	}
-	symlink(t, pipe, "e.txt") // a tracked file that is a symlink to a pipe now
+	symlink(t, "p", "e.txt") // a tracked file that is a symlink to a pipe now
 	out, code = recapWithin(t, pipes)
-	if want := "\ne.txt  type changed (file, symlink or submodule), +1 −1, symlink: -e  +" + pipe + "\n"; code != 0 || !strings.Contains(out, want) {
+	if want := "\ne.txt  type changed (file, symlink or submodule), +1 −1, symlink: -e  +p\n"; code != 0 || !strings.Contains(out, want) {
 		t.Errorf("a tracked file that became a symlink: exit %d, missing %q in\n%s", code, want, out)
 	}
 	os.Remove("b.txt") // a tracked file that is a pipe now
@@ -98,7 +102,7 @@ func TestSpecialFiles(t *testing.T) {
 	for _, want := range []string{
 		"recap: HEAD → working tree: 2 files changed, +1 −2, 1 untracked\n",
 		"\nb.txt  deleted, 1 line, now a named pipe, which git can't diff or add\n",
-		"\ne.txt  type changed (file, symlink or submodule), +1 −1, symlink: -e  +" + pipe + "\n",
+		"\ne.txt  type changed (file, symlink or submodule), +1 −1, symlink: -e  +p\n",
 		"\nulink  untracked, 1 line, symlink\n",
 	} {
 		if code != 0 || !strings.Contains(out, want) {
