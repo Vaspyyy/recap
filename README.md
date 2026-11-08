@@ -109,6 +109,14 @@ The numbers are tokens. The savings are smallest on small diffs, where recap's l
 
 Before release, recap went through three review rounds in which several models used it to describe branches and commits, write PR descriptions, release notes and commit messages, and review a refactor with a planted bug, comparing it with plain git and trying to break it. All of them found the bug from recap's overview. What they found is covered by tests that build real git repositories.
 
+## JSON
+
+`--json` prints one JSON document instead of the text, for programs that use recap's results: the envelope every [Prism](https://github.com/Vaspyyy/prism) tool prints, with recap's result in the shape of Prism's `report.Recap` ([format](https://github.com/Vaspyyy/prism/blob/main/docs/output.md)). It holds the two sides compared, each file with its status and line counts, each changed symbol with its ref (the same as in the text, with `#N`), signatures, and where moved or extracted code came from, the commit for `recap show`, the commits with their files for `recap log`, and with `--show` each symbol's whole diff. Paths are relative to the repository root.
+
+It goes to stdout also when recap fails, as an error with a code (`usage`, `no_match` with the refs that did change, `ambiguous`, `failed`), and the exit code stays the same. The text budget doesn't apply: lists are complete up to 10,000 items, or `-b N` items when `-b` is given, and `truncated` says when something was cut. `-p` can't be combined with `--json`.
+
+Text stays the default, and it's what agents should read: it says the same in far fewer tokens.
+
 ## Limits
 
 recap compares definitions, not behaviour: it tells you that a function changed and, for small changes, which lines, but not what the change means. Definitions the outline rules don't see (Go `var` blocks, macros, configuration keys, one-line class members in JavaScript) count as lines outside definitions or as changes of the enclosing symbol. When the exact change matters, use `--show` or `git diff`.

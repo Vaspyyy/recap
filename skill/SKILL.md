@@ -37,6 +37,8 @@ notes.txt  untracked, 12 lines
 | What did a commit do to one function? | `recap --show path/file.go:Name@b681ef1` (same as `recap show b681ef1 --show path/file.go:Name`) |
 | The overview and then the full diff | `recap -p` |
 
+`--json` prints the same as one JSON document for programs (Prism's `report.Recap`, https://github.com/Vaspyyy/prism/blob/main/docs/output.md); read the text yourself, it's shorter.
+
 ## Refs
 
 glint, seek, recap and crux all print and accept the same refs: `path`, `path:Name` (qualified: `Repo.Open`, `outer.inner`), `path:12` / `12:3` / `12-40` (a line, with a column, a range; resolved to the innermost symbol containing it), `@rev` (a symbol as it was in a commit) and `#N` (the Nth of several definitions with the same name). Paths are repo-relative. Copy refs from any tool's output into `--show`: in the overview, a file's path + `:` + a symbol's name as shown is one (`outline/outline.go:scanner.stripComments`), and so are a compiler's or crux's `file:line`.

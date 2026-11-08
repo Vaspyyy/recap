@@ -6,6 +6,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/Vaspyyy/prism/ref"
 	prismrepo "github.com/Vaspyyy/prism/repo" // "repo" is the tests' helper
+	"github.com/Vaspyyy/prism/report"
 	"github.com/Vaspyyy/recap/internal/analyze"
 	"github.com/Vaspyyy/recap/internal/gitx"
 	"github.com/Vaspyyy/recap/internal/render"
@@ -26,19 +28,57 @@ const version = "0.2.0"
 
 type opts struct {
 	staged, patch, agent, noUntracked bool
+	json                              bool
 	show                              string
 	showSet                           bool
 	budget, n                         int
-	nSet                              bool
+	budgetSet, nSet                   bool
 	revs, paths                       []string
 	sub                               string // "", "log" or "show"
 }
 
 func main() { os.Exit(run(os.Args[1:])) }
 
-func fail(msg string) int {
-	fmt.Fprintln(os.Stderr, "recap:", msg)
-	return 2
+// failure is why a run failed: printed to stderr, or with --json as the
+// envelope's error.
+type failure struct {
+	code       string // report.CodeUsage, CodeNoMatch, CodeAmbiguous or CodeFailed
+	msg        string
+	candidates []string // refs a program can pick from instead (no_match, ambiguous)
+}
+
+func usage(msg string) *failure  { return &failure{code: report.CodeUsage, msg: msg} }
+func failed(msg string) *failure { return &failure{code: report.CodeFailed, msg: msg} }
+
+func noMatch(msg string, candidates []string) *failure {
+	return &failure{code: report.CodeNoMatch, msg: msg, candidates: candidates}
+}
+
+// gitFailure is a failure for an error from gitx: a usage error when it's
+// about the arguments (an unknown revision), else a failure.
+func gitFailure(err error) *failure {
+	var arg *gitx.ArgError
+	if errors.As(err, &arg) {
+		return usage(err.Error())
+	}
+	return failed(err.Error())
+}
+
+// jsonFlag reports whether args ask for --json, read before parsing so that
+// a usage error is reported as JSON too. Like parse, it skips flags' values
+// and stops at "--".
+func jsonFlag(args []string) bool {
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--":
+			return false
+		case "-b", "--budget", "-n", "--max-count", "--show":
+			i++
+		case "--json":
+			return true
+		}
+	}
+	return false
 }
 
 func parse(args []string) (*opts, int, string) {
@@ -93,6 +133,8 @@ func parse(args []string) (*opts, int, string) {
 			o.patch = true
 		case a == "-A" || a == "--agent":
 			o.agent = true
+		case a == "--json":
+			o.json = true
 		case a == "--no-untracked":
 			o.noUntracked = true
 		case (a == "--show" || strings.HasPrefix(a, "--show=")) && o.showSet:
@@ -105,9 +147,11 @@ func parse(args []string) (*opts, int, string) {
 		case a == "-b" || a == "--budget":
 			if v, msg = value(&i, a); msg == "" {
 				o.budget, msg = number(v, a)
+				o.budgetSet = true
 			}
 		case strings.HasPrefix(a, "--budget="):
 			o.budget, msg = number(strings.TrimPrefix(a, "--budget="), "--budget")
+			o.budgetSet = true
 		case a == "-n" || a == "--max-count":
 			if v, msg = value(&i, a); msg == "" {
 				o.n, msg = number(v, a)
@@ -138,8 +182,50 @@ func parse(args []string) (*opts, int, string) {
 		return nil, 2, "recap show is about a commit; --staged doesn't apply"
 	case o.showSet && strings.TrimSpace(o.show) == "":
 		return nil, 2, "--show needs a target: file:name, file:line, name, or a file"
+	case o.json && o.patch:
+		return nil, 2, "-p prints git's patch as text, which --json can't hold; for one symbol's diff lines use --json --show TARGET"
 	}
 	return o, -1, ""
+}
+
+// cli is one run's output: text, or with --json one envelope.
+type cli struct {
+	args   []string
+	json   bool
+	out    *bufio.Writer
+	detect func() (*prismrepo.Info, error)
+	lim    limiter // --json: the lists' cap, and what it cut
+}
+
+// fail reports a failure and returns the exit code.
+func (c *cli) fail(f *failure) int {
+	if !c.json {
+		fmt.Fprintln(os.Stderr, "recap:", f.msg)
+		return 2
+	}
+	e := c.envelope()
+	l := limiter{max: c.lim.max} // the candidates are all the error shows
+	e.Fail(f.code, f.msg, capped(&l, f.candidates)...)
+	e.Truncated = l.cut
+	report.Write(c.out, e)
+	return 2
+}
+
+// emit prints a result as the envelope.
+func (c *cli) emit(res *report.Recap) int {
+	e := c.envelope()
+	e.Result, e.Truncated = res, c.lim.cut
+	report.Write(c.out, e)
+	return 0
+}
+
+func (c *cli) envelope() *report.Envelope {
+	info, err := c.detect()
+	if err != nil {
+		cwd, _ := os.Getwd()
+		info = &prismrepo.Info{Root: cwd} // paths must be absolutable anyway
+	}
+	return report.New("recap", version, c.args, info)
 }
 
 func run(args []string) int {
@@ -148,33 +234,40 @@ func run(args []string) int {
 		fmt.Print(msg)
 		return 0
 	}
+	c := &cli{args: args, json: jsonFlag(args), out: bufio.NewWriter(os.Stdout), lim: limiter{max: report.MaxItems}}
+	defer c.out.Flush()
+	c.detect = sync.OnceValues(func() (*prismrepo.Info, error) { return prismrepo.Detect(".") })
+	if c.json {
+		go c.detect() // the envelope names the repository: find it alongside the comparison's git commands
+	}
 	if code > 0 {
-		return fail(msg)
+		return c.fail(usage(msg))
+	}
+	if c.json && o.budgetSet { // the text budget applies to JSON only when given
+		c.lim.max = min(o.budget, report.MaxItems)
 	}
 	top, err := gitx.Toplevel()
 	if err != nil {
-		return fail("not inside a git repository")
+		return c.fail(failed("not inside a git repository"))
 	}
-	human := !o.agent && term.IsTerminal(int(os.Stdout.Fd()))
+	human := !o.agent && !c.json && term.IsTerminal(int(os.Stdout.Fd()))
 	color := human && os.Getenv("NO_COLOR") == ""
-	out := bufio.NewWriter(os.Stdout)
-	defer out.Flush()
+	out := c.out
 	if o.sub == "log" {
-		return runLog(out, top, o, color)
+		return c.runLog(top, o, color)
 	}
 	var showRef ref.Ref
-	detect := sync.OnceValues(func() (*prismrepo.Info, error) { return prismrepo.Detect(".") })
 	if o.showSet {
 		// --show needs the repository to read paths: find it alongside the
 		// comparison's git commands, and wait for it only to tell whether
 		// the text after an '@' is a revision
-		go detect()
+		go c.detect()
 		showRef = ref.Parse(o.show, func(rev string) bool {
-			info, err := detect()
+			info, err := c.detect()
 			return err == nil && info.IsRev(rev)
 		})
 		if msg := atRev(o, showRef); msg != "" {
-			return fail(msg)
+			return c.fail(usage(msg))
 		}
 	}
 
@@ -186,29 +279,42 @@ func run(args []string) int {
 			rev = o.revs[0]
 		}
 		if !gitx.HasCommits() {
-			return fail("no commits yet")
+			return c.fail(failed("no commits yet"))
 		}
 		cm, err := gitx.ShowCommit(rev)
 		if err != nil {
-			return fail(err.Error())
+			return c.fail(gitFailure(err))
 		}
 		commit = &cm
 		comp = gitx.CommitComparison(cm, o.paths)
 	} else {
 		if comp, err = gitx.Compare(o.revs, o.paths, o.staged); err != nil {
-			return fail(err.Error())
+			return c.fail(gitFailure(err))
 		}
 	}
 	files, contents, err := collect(top, comp, !o.noUntracked && comp.New.Worktree)
 	if err != nil {
-		return fail(err.Error())
+		return c.fail(failed(err.Error()))
 	}
 	if o.showSet {
-		info, err := detect()
+		info, err := c.detect()
 		if err != nil {
-			return fail(err.Error())
+			return c.fail(failed(err.Error()))
 		}
-		return show(out, comp, files, contents, info, showRef, o.show, color)
+		return c.show(comp, commit, files, contents, info, showRef, o.show, color)
+	}
+	if c.json {
+		res := c.recap(comp, commit)
+		res.Files = c.files(files, files)
+		if commit != nil && len(commit.Parents) > 1 {
+			res.Notes = append(res.Notes, "a merge: compared with its first parent")
+		}
+		if comp.New.Worktree || comp.New.Index {
+			if m := gitx.MergeHead(); m != "" {
+				res.Notes = append(res.Notes, "merge in progress: merging "+m+"; resolve the conflicts, then commit (or git merge --abort)")
+			}
+		}
+		return c.emit(res)
 	}
 
 	if commit != nil {
@@ -242,7 +348,7 @@ func run(args []string) int {
 	if o.patch {
 		patch, err := gitx.FullDiff(comp, 3, color, nil)
 		if err != nil {
-			return fail(err.Error())
+			return c.fail(failed(err.Error()))
 		}
 		fmt.Fprintln(out)
 		out.Write(patch)
@@ -415,14 +521,32 @@ func ext(p string) string {
 	return ""
 }
 
-func runLog(out *bufio.Writer, top string, o *opts, color bool) int {
+func (c *cli) runLog(top string, o *opts, color bool) int {
+	out := c.out
 	if !gitx.HasCommits() && len(o.revs) == 0 {
+		if c.json {
+			return c.emit(&report.Recap{Files: []report.RecapFile{}, Commits: []report.RecapLog{}, Range: "HEAD"})
+		}
 		fmt.Fprintln(out, "recap log: no commits yet")
 		return 0
 	}
 	commits, err := gitx.Log(o.n, o.revs, o.paths)
 	if err != nil {
-		return fail(err.Error())
+		return c.fail(gitFailure(err))
+	}
+	if c.json { // a log has no sides: old and new stay empty
+		res := &report.Recap{Files: []report.RecapFile{}, Commits: []report.RecapLog{}, Range: "HEAD"}
+		if len(o.revs) > 0 {
+			res.Range = strings.Join(o.revs, " ")
+		}
+		for _, cm := range capped(&c.lim, commits) {
+			files, _, err := collect(top, gitx.CommitComparison(cm, o.paths), false)
+			if err != nil {
+				return c.fail(failed(err.Error()))
+			}
+			res.Commits = append(res.Commits, report.RecapLog{Commit: commitOf(cm), Files: c.files(files, files)})
+		}
+		return c.emit(res)
 	}
 	for k, cm := range commits {
 		if k > 0 {
@@ -444,7 +568,7 @@ func runLog(out *bufio.Writer, top string, o *opts, color bool) int {
 		}
 		files, _, err := collect(top, gitx.CommitComparison(cm, o.paths), false)
 		if err != nil {
-			return fail(err.Error())
+			return c.fail(failed(err.Error()))
 		}
 		per := max(3, o.budget/max(1, len(commits))-2)
 		fmt.Fprint(out, render.Compact(files, render.Options{Color: color, Budget: per, Indent: "  "}))
@@ -505,16 +629,52 @@ func candidates(files []*analyze.File) []target {
 }
 
 // show prints the diff of the changed symbols a ref names, or of a file.
-func show(out *bufio.Writer, comp *gitx.Comparison, files []*analyze.File, contents map[string]pair, info *prismrepo.Info, r ref.Ref,
-	want string, color bool) int {
+func (c *cli) show(comp *gitx.Comparison, commit *gitx.Commit, files []*analyze.File, contents map[string]pair, info *prismrepo.Info,
+	r ref.Ref, want string, color bool) int {
+	sel, f := pick(comp, files, info, r, want)
+	if f != nil {
+		return c.fail(f)
+	}
+	if c.json {
+		res := c.recap(comp, commit)
+		if res.Show, res.Notes, f = c.shows(sel, files, contents); f != nil {
+			return c.fail(f)
+		}
+		return c.emit(res)
+	}
+	out := c.out
+	if sel.note != "" {
+		fmt.Fprintln(out, sel.note)
+	}
+	if sel.whole != nil {
+		return c.showFiles(sel.whole, contents, want, color)
+	}
+	if len(sel.hits) > 1 {
+		fmt.Fprintf(out, "%d matches for %s\n\n", len(sel.hits), strconv.Quote(want))
+	}
+	for k, t := range sel.hits {
+		if k > 0 {
+			fmt.Fprintln(out)
+		}
+		printSymbol(out, t, color)
+	}
+	return 0
+}
+
+// selection is what --show prints: changed symbols, or whole files.
+type selection struct {
+	hits  []target
+	whole []*analyze.File // "recap --show path"
+	note  string          // printed first: the path also names another changed file
+}
+
+// pick finds what a --show ref names, or says why nothing (or too much) matches.
+func pick(comp *gitx.Comparison, files []*analyze.File, info *prismrepo.Info, r ref.Ref, want string) (selection, *failure) {
 	cwd, _ := os.Getwd()
 	matched, note := changedFiles(info, r.Path, cwd, files)
 	if !r.HasTarget || r.Name == "" && !r.IsLocation() { // "recap --show path": the whole file
 		if len(matched) > 0 {
-			if note != "" {
-				fmt.Fprintln(out, note)
-			}
-			return showFiles(out, matched, contents, want, color)
+			return selection{whole: matched, note: note}, nil
 		}
 		r = r.AsName() // a bare name: "Readback", "Repo.open"
 	}
@@ -524,7 +684,8 @@ func show(out *bufio.Writer, comp *gitx.Comparison, files []*analyze.File, conte
 	case len(matched) > 0:
 		scope = matched
 	case r.IsLocation():
-		return fail(fileMiss(info, r.Path, cwd, comp) + changedList(candidates(files), "changed"))
+		all := candidates(files)
+		return selection{}, noMatch(fileMiss(info, r.Path, cwd, comp)+changedList(all, "changed"), changedRefs(all))
 	default: // a name with ':' in it (C++ "Foo::bar", Lua "obj:method"), or a file that didn't change
 		missed, r = r.Path, r.AsName()
 	}
@@ -541,8 +702,9 @@ func show(out *bufio.Writer, comp *gitx.Comparison, files []*analyze.File, conte
 	var hits []target
 	if r.IsLocation() {
 		var why string
-		if hits, why = located(r, scope, all, comp); len(hits) == 0 {
-			return fail(why)
+		var near []string
+		if hits, why, near = located(r, scope, all, comp); len(hits) == 0 {
+			return selection{}, noMatch(why, near)
 		}
 	} else {
 		hits = named(r, scope, all)
@@ -583,31 +745,20 @@ func show(out *bufio.Writer, comp *gitx.Comparison, files []*analyze.File, conte
 			if comp.New.Worktree {
 				hint = " (--show looks at the working tree unless you give a commit or range: recap main...feature --show " + want + ")"
 			}
-			return fail("nothing changed matches " + strconv.Quote(want) + " in " + comp.Describe() + hint)
+			return selection{}, noMatch("nothing changed matches "+strconv.Quote(want)+" in "+comp.Describe()+hint, nil)
 		case missed != "":
-			return fail(fileMiss(info, missed, cwd, comp) + list)
+			return selection{}, noMatch(fileMiss(info, missed, cwd, comp)+list, changedRefs(all))
 		}
-		return fail("no changed symbol matches " + strconv.Quote(want) + list)
+		return selection{}, noMatch("no changed symbol matches "+strconv.Quote(want)+list, changedRefs(all))
 	case len(hits) > 8:
 		var names []string
-		for _, t := range hits[:8] {
+		for _, t := range hits {
 			names = append(names, t.ref())
 		}
-		return fail(fmt.Sprintf("%q matches %d symbols; be more specific, e.g. %s", want, len(hits), strings.Join(names, ", ")))
+		return selection{}, &failure{code: report.CodeAmbiguous, candidates: names,
+			msg: fmt.Sprintf("%q matches %d symbols; be more specific, e.g. %s", want, len(hits), strings.Join(names[:8], ", "))}
 	}
-	if note != "" {
-		fmt.Fprintln(out, note)
-	}
-	if len(hits) > 1 {
-		fmt.Fprintf(out, "%d matches for %s\n\n", len(hits), strconv.Quote(want))
-	}
-	for k, t := range hits {
-		if k > 0 {
-			fmt.Fprintln(out)
-		}
-		printSymbol(out, t, color)
-	}
-	return 0
+	return selection{hits: hits, note: note}, nil
 }
 
 // changedFiles returns the files of the comparison p names, by their path
@@ -644,7 +795,8 @@ func changedFiles(info *prismrepo.Info, p, cwd string, files []*analyze.File) ([
 }
 
 // showFiles prints the diff of whole files.
-func showFiles(out *bufio.Writer, files []*analyze.File, contents map[string]pair, want string, color bool) int {
+func (c *cli) showFiles(files []*analyze.File, contents map[string]pair, want string, color bool) int {
+	out := c.out
 	if len(files) > 1 {
 		fmt.Fprintf(out, "%d matches for %s\n\n", len(files), strconv.Quote(want))
 	}
@@ -652,8 +804,8 @@ func showFiles(out *bufio.Writer, files []*analyze.File, contents map[string]pai
 		if k > 0 {
 			fmt.Fprintln(out)
 		}
-		if code := showFile(out, f, contents, color); code != 0 {
-			return code
+		if fl := showFile(out, f, contents, color); fl != nil {
+			return c.fail(fl)
 		}
 	}
 	return 0
@@ -705,8 +857,9 @@ func named(r ref.Ref, scope []*analyze.File, all []target) []target {
 
 // located returns the changed symbol containing a location ref's line (in
 // the new version), or the changed symbols in its range. Without one, why
-// says which symbol holds the line, that it didn't change, and what did.
-func located(r ref.Ref, scope []*analyze.File, all []target, comp *gitx.Comparison) (hits []target, why string) {
+// says which symbol holds the line, that it didn't change, and what did
+// (near: their refs).
+func located(r ref.Ref, scope []*analyze.File, all []target, comp *gitx.Comparison) (hits []target, why string, near []string) {
 	var whys []string
 	for _, f := range scope {
 		old := f.Status == 'D' // a deleted file only has its old lines
@@ -766,12 +919,13 @@ func located(r ref.Ref, scope []*analyze.File, all []target, comp *gitx.Comparis
 		}
 		if list := changedList(mine, "changed in "+render.Path(f.Path)); list != "" {
 			w += list
+			near = append(near, changedRefs(mine)...)
 		} else {
 			w += "; no symbol in it changed (recap --show " + render.ShellArg(f.Path) + " shows its diff)"
 		}
 		whys = append(whys, w)
 	}
-	return hits, strings.Join(whys, "; ")
+	return hits, strings.Join(whys, "; "), near
 }
 
 // innermost is the innermost target in path containing the line, or the
@@ -792,15 +946,21 @@ func innermost(ts []ref.Target, path string, line, end int) int {
 	return best
 }
 
-// changedList is "; changed: a.go:X, b.go:Y" for the targets (by their
-// current names), or "" if there are none.
-func changedList(all []target, label string) string {
+// changedRefs are the refs of the targets, by their current names.
+func changedRefs(all []target) []string {
 	var names []string
 	for _, t := range all {
 		if t.name == t.ch.Name {
 			names = append(names, t.ref())
 		}
 	}
+	return names
+}
+
+// changedList is "; changed: a.go:X, b.go:Y" for the targets (by their
+// current names), or "" if there are none.
+func changedList(all []target, label string) string {
+	names := changedRefs(all)
 	if len(names) == 0 {
 		return ""
 	}
@@ -921,19 +1081,28 @@ func colorize(l string, color bool) string {
 	return l
 }
 
-func showFile(out *bufio.Writer, f *analyze.File, contents map[string]pair, color bool) int {
-	c := contents[f.Path]
+func showFile(out *bufio.Writer, f *analyze.File, contents map[string]pair, color bool) *failure {
 	if f.LineEndings != "" {
 		fmt.Fprintf(out, "%s: line endings only (%s), no other change\n", render.Path(f.Path), f.LineEndings)
-		return 0
+		return nil
 	}
-	ops := analyze.LineDiff(splitKeep(c.old), splitKeep(c.new))
-	if ops == nil || f.Binary {
-		return fail(f.Path + ": too large or binary for --show; use git diff -- " + f.Path)
+	ops, fl := fileDiff(f, contents)
+	if fl != nil {
+		return fl
 	}
 	fmt.Fprintf(out, "%s%s%s  (%s)\n", onOff(color, true), render.Path(f.Path), onOff(color, false), strings.TrimPrefix(render.Summary([]*analyze.File{f}, false), "1 file changed, "))
 	printLines(out, analyze.Context(ops, 3), color)
-	return 0
+	return nil
+}
+
+// fileDiff is a whole file's line diff, for --show path.
+func fileDiff(f *analyze.File, contents map[string]pair) ([]analyze.Op, *failure) {
+	c := contents[f.Path]
+	ops := analyze.LineDiff(splitKeep(c.old), splitKeep(c.new))
+	if ops == nil || f.Binary {
+		return nil, failed(f.Path + ": too large or binary for --show; use git diff -- " + f.Path)
+	}
+	return ops, nil
 }
 
 func splitKeep(b []byte) []string {
