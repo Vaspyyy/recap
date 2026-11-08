@@ -11,7 +11,7 @@ import (
 	"strings"
 	"unicode"
 
-	"github.com/Vaspyyy/glint/outline"
+	"github.com/Vaspyyy/prism/outline"
 	"github.com/Vaspyyy/recap/internal/gitx"
 )
 
