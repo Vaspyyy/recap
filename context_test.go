@@ -148,7 +148,7 @@ func TestAcceptanceShowCommit(t *testing.T) {
 	if f == nil {
 		t.Fatal("recap show wrote no focus")
 	}
-	if !f.Has("internal/files/files.go:List") || f.Range != id || f.New != id || f.Old != gitOut(t, "rev-parse", id+"^") || f.By != "recap" || f.Total != 1 {
+	if !f.Has("internal/files/files.go:List") || f.Range != id[:7] || f.New != id || f.Old != gitOut(t, "rev-parse", id+"^") || f.By != "recap" || f.Total != 1 {
 		t.Errorf("focus %+v", f)
 	}
 	// seek reads the working tree: once List is renamed there, it isn't suggested
@@ -169,20 +169,19 @@ func TestFocusIsSetByCommitsOnly(t *testing.T) {
 	gpuSyms := []string{"gpu.go:CreateDevice", "gpu.go:Readback", "gpu.go:UploadScene", "gpu.go:Upscale"} // not the removed Dispatch
 
 	for _, c := range []struct {
-		args               []string
-		rng, old, new      string
-		syms               []string
-		commitsOnBothSides bool
+		args          []string
+		rng, old, new string
+		syms          []string
 	}{
-		{[]string{"show", "HEAD"}, "HEAD", parent, head, gpuSyms, true},
-		{[]string{"show"}, short, parent, head, gpuSyms, true}, // HEAD moves on; the commit doesn't
-		{[]string{"HEAD~1", "HEAD"}, "HEAD~1..HEAD", parent, head, gpuSyms, true},
-		{[]string{"HEAD~1..HEAD"}, "HEAD~1..HEAD", parent, head, gpuSyms, true},
-		{[]string{"HEAD~1...HEAD"}, "HEAD~1...HEAD", parent, head, gpuSyms, true}, // old: the merge base
-		{[]string{"--show", "Readback@HEAD"}, "HEAD", parent, head, gpuSyms, true},
-		{[]string{"--json", "show", "HEAD"}, "HEAD", parent, head, gpuSyms, true},
-		{[]string{"show", "HEAD~1"}, "HEAD~1", gitOut(t, "hash-object", "-t", "tree", "/dev/null"), parent,
-			[]string{"gpu.go:Context", "gpu.go:CreateDevice", "gpu.go:Upload", "gpu.go:Dispatch", "gpu.go:Readback"}, true}, // a new file: its definitions
+		{[]string{"show", "HEAD"}, short, parent, head, gpuSyms}, // HEAD moves on; the commit doesn't
+		{[]string{"show"}, short, parent, head, gpuSyms},
+		{[]string{"HEAD~1", "HEAD"}, "HEAD~1..HEAD", parent, head, gpuSyms},
+		{[]string{"HEAD~1..HEAD"}, "HEAD~1..HEAD", parent, head, gpuSyms},
+		{[]string{"HEAD~1...HEAD"}, "HEAD~1...HEAD", parent, head, gpuSyms}, // old: the merge base
+		{[]string{"--show", "Readback@HEAD"}, short, parent, head, gpuSyms},
+		{[]string{"--json", "show", "HEAD"}, short, parent, head, gpuSyms},
+		{[]string{"show", "HEAD~1"}, parent[:7], gitOut(t, "hash-object", "-t", "tree", "/dev/null"), parent,
+			[]string{"gpu.go:Context", "gpu.go:CreateDevice", "gpu.go:Upload", "gpu.go:Dispatch", "gpu.go:Readback"}}, // a new file: its definitions
 	} {
 		clearFocus(t)
 		if out, code := recap(t, c.args...); code != 0 {
@@ -285,7 +284,7 @@ func TestShowFillsFromFocusRange(t *testing.T) {
 	filesRepo(t)
 	recap(t, "HEAD~1..HEAD")
 	if out, code := recap(t, "--show", "List"); code != 0 ||
-		!strings.HasPrefix(out, "context: nothing matches in the working tree; showing focus range HEAD~1..HEAD\nchanged func List") {
+		!strings.HasPrefix(out, "context: nothing matches in the working tree; showing focus HEAD~1..HEAD\nchanged func List") {
 		t.Errorf("exit %d\n%s", code, out)
 	}
 }

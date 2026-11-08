@@ -58,27 +58,26 @@ func (c *cli) load(o *opts) {
 var markOrder = []string{work.MarkChanged, work.MarkBranch, work.MarkFocus, work.MarkFailing}
 
 // marks are the context marks of a symbol recap prints, by its refs (a
-// rename's new ref and its old one). On the focus's own comparison [focus]
-// is left out: every symbol there is in the focus, so the mark would say
-// nothing.
+// rename's new ref and its old one), counted as shown. On the focus's own
+// comparison [focus] is left out: every symbol there is in the focus, so
+// the mark would say nothing.
 func (c *cli) marks(refs ...string) []string {
 	st := c.st
 	if st == nil {
 		return nil
 	}
-	if f := st.Focus; f != nil && c.cur != nil && c.cur.Old.Rev == f.Old && c.cur.New.Rev == f.New {
-		st.Focus = nil // State.Marks can't leave a layer out; Line and Context still see the focus
-		defer func() { st.Focus = f }()
-	}
+	f := st.Focus
+	own := f != nil && c.cur != nil && c.cur.Old.Rev == f.Old && c.cur.New.Rev == f.New
 	var out []string
 	for _, r := range refs {
-		for _, m := range st.Marks(r) {
-			if !slices.Contains(out, m) {
+		for _, m := range st.Peek(r) {
+			if !slices.Contains(out, m) && !(own && m == work.MarkFocus) {
 				out = append(out, m)
 			}
 		}
 	}
 	slices.SortStableFunc(out, func(a, b string) int { return slices.Index(markOrder, a) - slices.Index(markOrder, b) })
+	st.Show(out...)
 	return out
 }
 
@@ -96,13 +95,11 @@ func (c *cli) setFocus(o *opts, comp *gitx.Comparison, commit *gitx.Commit, file
 	c.st.Store.SetFocus("recap", focus.Focus{Range: focusRange(o, commit), Old: comp.Old.Rev, New: comp.New.Rev, Symbols: syms, Total: len(syms)})
 }
 
-// focusRange is the focus's range: the revisions as given, A..B for two of
-// them (what git diff A B compares), and the commit's short id for recap
-// show without one ("HEAD" would move on).
+// focusRange is the focus's range (focus.Focus.Range): recap show's commit
+// by its short id (a name like HEAD would move on), a range as given, and
+// A..B for two revisions (what git diff A B compares).
 func focusRange(o *opts, commit *gitx.Commit) string {
 	switch {
-	case o.sub == "show" && len(o.revs) == 1:
-		return o.revs[0]
 	case o.sub == "show":
 		return commit.Short
 	case len(o.revs) == 2:
@@ -136,15 +133,6 @@ func focusSymbols(files []*analyze.File) []string {
 		}
 	}
 	return out
-}
-
-// focusName is how a fill-in names the focus: "commit b681ef1", or "range
-// main...feature" as recap was given it.
-func focusName(f *focus.Focus) string {
-	if strings.Contains(f.Range, "..") {
-		return "range " + f.Range
-	}
-	return "commit " + f.New[:min(len(f.New), 7)]
 }
 
 // focusComparison is the comparison the focus records, by its commits.
@@ -212,7 +200,7 @@ func (c *cli) fill(top string, o *opts, info *prismrepo.Info, r ref.Ref, want st
 		}
 	}
 	c.st.Use(work.Fill)
-	c.st.Note("nothing matches in the working tree; showing focus " + focusName(f))
+	c.st.Note("nothing matches in the working tree; showing focus " + f.Name()) // the context: line's words
 	return v, sel, true
 }
 
