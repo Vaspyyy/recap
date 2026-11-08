@@ -66,7 +66,7 @@ Signature changes are shown as `was:` and `now:` lines, also for signatures spre
 
 When the overview has to be cut, every file keeps its line, each file gets a share of the rest, and signature changes, renames and removals come before plain edits. What's left out is summarised by kind, for example `… +390 more changes: 390 changed (each +1 −1)`.
 
-Symbols come from the outline rules of [glint](https://github.com/Vaspyyy/glint), which cover Go, Rust, Python, JavaScript and TypeScript, C and C++, Java, Kotlin, C#, GDScript, shell, Lua, Ruby and Markdown headings. Other files get their line counts, plus the changed lines when there are only one or two.
+Symbols come from the outline rules in [Prism](https://github.com/Vaspyyy/prism) (shared with glint and seek), which cover Go, Rust, Python, JavaScript and TypeScript, C and C++, Java, Kotlin, C#, GDScript, shell, Lua, Ruby and Markdown headings. Other files get their line counts, plus the changed lines when there are only one or two.
 
 ## For coding agents
 
