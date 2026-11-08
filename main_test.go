@@ -802,3 +802,17 @@ func TestShowRefs(t *testing.T) {
 		t.Errorf("two commits: exit %d, %s", code, errs)
 	}
 }
+
+// A definition-looking line inside a string or comment that spans lines
+// isn't a definition (Prism v0.8.0's outline): an edit there is a change
+// outside definitions, not to a phantom "func Fake".
+func TestNoSymbolsInsideMultilineStrings(t *testing.T) {
+	write, commit := repo(t)
+	src := "package a\n\nconst tmpl = `\nfunc Fake() {\n\tline one\n}\n`\n\nfunc Real() int {\n\treturn 1\n}\n"
+	write("a.go", src)
+	commit("first")
+	write("a.go", strings.Replace(src, "line one", "line two", 1))
+	if out, _ := recap(t); out != "recap: HEAD → working tree: 1 file changed, +1 −1\n\na.go  modified, +1 −1: -\tline one  +\tline two\n" {
+		t.Errorf("no changed symbol and no next: line:\n%s", out)
+	}
+}
