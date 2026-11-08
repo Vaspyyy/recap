@@ -102,6 +102,19 @@ func (d Def) RefName() string { return refName(d.Name, d.Ordinal) }
 
 func refName(name string, ordinal int) string { return ref.Symbol("", name, ordinal).String() }
 
+// Refs are the change's refs in the file at path: its own, and for a rename
+// the old one too.
+func (c Change) Refs(path string) []string {
+	refs := []string{ref.Symbol(path, c.Name, c.Ordinal).String()}
+	if c.What == "renamed" && c.OldName != "" {
+		refs = append(refs, ref.Symbol(path, c.OldName, c.OldOrdinal).String())
+	}
+	return refs
+}
+
+// Ref is the definition's ref in the file at path.
+func (d Def) Ref(path string) string { return ref.Symbol(path, d.Name, d.Ordinal).String() }
+
 var (
 	lockFiles = map[string]bool{"Cargo.lock": true, "go.sum": true, "package-lock.json": true, "yarn.lock": true,
 		"pnpm-lock.yaml": true, "poetry.lock": true, "Pipfile.lock": true, "composer.lock": true, "Gemfile.lock": true,
@@ -261,8 +274,10 @@ func defs(p string, syms []outline.Symbol, lines []string) []Def {
 }
 
 // Symbols lists a new or deleted file's top-level definitions for display.
-// Overloads next to each other are one entry, under their plain name.
-func (a *File) Symbols() []string {
+// Overloads next to each other are one entry, under their plain name. mark,
+// if not nil, gives the context marks printed after a name (" [failing]"),
+// by its ref.
+func (a *File) Symbols(mark func(ref string) string) []string {
 	var out, plain []string
 	var count []int
 	for _, d := range a.Defs {
@@ -282,13 +297,17 @@ func (a *File) Symbols() []string {
 		case a.Status == 'D' && d.Public:
 			note = " (public)"
 		}
-		p := label(d.Kind, d.Name) + note
+		marks := ""
+		if mark != nil {
+			marks = mark(d.Ref(a.Path))
+		}
+		p := label(d.Kind, d.Name) + marks + note
 		if n := len(out); n > 0 && plain[n-1] == p {
 			count[n-1]++
 			out[n-1] = p + " ×" + itoa(count[n-1]) // overloads: one entry
 			continue
 		}
-		out = append(out, label(d.Kind, d.RefName())+note)
+		out = append(out, label(d.Kind, d.RefName())+marks+note)
 		plain = append(plain, p)
 		count = append(count, 1)
 	}

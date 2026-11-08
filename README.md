@@ -53,6 +53,17 @@ glint, seek, recap and crux name files, symbols and locations the same way, so a
 
 Paths are relative to the repository root. The format is specified in [Prism](https://github.com/Vaspyyy/prism/blob/main/docs/refs.md).
 
+## Context
+
+recap shares context with glint, seek and crux through [Prism](https://github.com/Vaspyyy/prism/blob/main/docs/context.md). It's on by default and never hides a result; it only marks and fills in, and says so:
+
+- `recap show <commit>` and a comparison of two commits (`recap A B`, `A..B`, `A...B`) record that commit or range as the focus, with the refs of its changed symbols, which seek and crux then mark `[focus]`. The working tree, `--staged` and `recap log` don't set it.
+- `recap --show NAME` on the working tree, when nothing there matches, shows the match in the focus instead: `context: nothing matches in the working tree; showing focus commit b681ef1`. With a revision, `--staged` or a line location it never does.
+- Changed symbols that failed in crux's last run are marked `[failing]`, and working-tree changes to symbols the focus changed are marked `[focus]`. A first `context:` line names what the marks come from.
+- `next:` lines at the bottom suggest `seek <ref>` for the most significant changed symbol that still exists in the working tree (seek searches the working tree), and `recap … --show <ref>` when the overview couldn't show that change inline. They come from the result, not from context.
+
+The focus is kept in the git dir (`.git/prism/`), per worktree and agent session, and expires after an hour. `--no-context` or `PRISM_NO_CONTEXT=1` neither reads nor records anything: the output then depends only on the arguments and the files, and is the same minus the marks, the `context:` line and fill-ins.
+
 ## What it reports
 
 Every changed file gets one line with its status (modified, new, deleted, renamed, untracked, binary, lock file, generated, minified, a merge conflict) and its added and removed lines, which are git's own numbers. Below it comes one line per changed symbol:
@@ -111,7 +122,7 @@ Before release, recap went through three review rounds in which several models u
 
 ## JSON
 
-`--json` prints one JSON document instead of the text, for programs that use recap's results: the envelope every [Prism](https://github.com/Vaspyyy/prism) tool prints, with recap's result in the shape of Prism's `report.Recap` ([format](https://github.com/Vaspyyy/prism/blob/main/docs/output.md)). It holds the two sides compared, each file with its status and line counts, each changed symbol with its ref (the same as in the text, with `#N`), signatures, and where moved or extracted code came from, the commit for `recap show`, the commits with their files for `recap log`, and with `--show` each symbol's whole diff. Paths are relative to the repository root.
+`--json` prints one JSON document instead of the text, for programs that use recap's results: the envelope every [Prism](https://github.com/Vaspyyy/prism) tool prints, with recap's result in the shape of Prism's `report.Recap` ([format](https://github.com/Vaspyyy/prism/blob/main/docs/output.md)). It holds the two sides compared, each file with its status and line counts, each changed symbol with its ref (the same as in the text, with `#N`), signatures, and where moved or extracted code came from, the commit for `recap show`, the commits with their files for `recap log`, and with `--show` each symbol's whole diff. Paths are relative to the repository root. `context` says what context the run used (`null` with `--no-context`), each symbol's `marks` hold its context marks, and `next` the same suggestions as the `next:` lines.
 
 It goes to stdout also when recap fails, as an error with a code (`usage`, `no_match` with the refs that did change, `ambiguous`, `failed`), and the exit code stays the same. The text budget doesn't apply: lists are complete up to 10,000 items, or `-b N` items when `-b` is given, and `truncated` says when something was cut. `-p` can't be combined with `--json`.
 

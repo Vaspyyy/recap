@@ -24,13 +24,28 @@ type Options struct {
 	Color  bool
 	Budget int // lines, roughly
 	Indent string
+	// Mark, if not nil, gives the context marks printed after a symbol's
+	// name (" [failing]"), by its refs (a rename's new ref, then its old one).
+	Mark func(refs ...string) string
 }
 
 type writer struct {
 	b     strings.Builder
 	c     pal
 	lines int
+	mark  func(refs ...string) string
 }
+
+// marks is the marks suffix for a symbol's refs, or "" without Options.Mark.
+func (w *writer) marks(refs ...string) string {
+	if w.mark == nil {
+		return ""
+	}
+	return w.mark(refs...)
+}
+
+// defMark is Options.Mark for one ref, as analyze.File.Symbols takes it.
+func (w *writer) defMark(ref string) string { return w.marks(ref) }
 
 func (w *writer) line(format string, a ...any) {
 	fmt.Fprintf(&w.b, format+"\n", a...)
@@ -124,7 +139,7 @@ func importance(ch analyze.Change) int {
 // then each file a few of its most important changes, then the rest in
 // file order.
 func Files(files []*analyze.File, o Options) string {
-	w := &writer{c: palette(o.Color)}
+	w := &writer{c: palette(o.Color), mark: o.Mark}
 	room := max(o.Budget, 10)
 	shownFiles := min(len(files), max(room, 30))
 	room -= shownFiles
@@ -270,7 +285,7 @@ func topLine(f *analyze.File) bool {
 func (w *writer) file(f *analyze.File, changes []analyze.Change, quota int, ind string, details map[string]bool) {
 	c := w.c
 	line := ind + c.bold + Path(f.Path) + c.reset + "  " + status(f, c, false)
-	if syms := f.Symbols(); len(syms) > 0 {
+	if syms := f.Symbols(w.defMark); len(syms) > 0 {
 		extra := ""
 		if len(syms) > 8 {
 			syms, extra = syms[:8], fmt.Sprintf(" +%d more", len(syms)-8)
@@ -287,7 +302,7 @@ func (w *writer) file(f *analyze.File, changes []analyze.Change, quota int, ind 
 		if used+changeLines(ch) > quota {
 			break
 		}
-		w.change(ch, ind, details[detailKey(f, ch)])
+		w.change(f.Path, ch, ind, details[detailKey(f, ch)])
 		used += changeLines(ch)
 		shown++
 	}
@@ -340,13 +355,14 @@ func summarize(rest []analyze.Change) string {
 	return plural(len(rest), "more change") + ": " + strings.Join(parts, ", ")
 }
 
-func (w *writer) change(ch analyze.Change, ind string, withDetail bool) {
+func (w *writer) change(path string, ch analyze.Change, ind string, withDetail bool) {
 	c := w.c
 	color := map[string]string{"changed": c.yellow, "added": c.green, "removed": c.red, "renamed": c.blue, "moved": c.blue}[ch.What]
 	name := Label(ch.Kind, ch.RefName())
 	if ch.What == "renamed" {
 		name = Label(ch.Kind, ch.OldRefName()) + " → " + ch.RefName()
 	}
+	marks := w.marks(ch.Refs(path)...)
 	where := "L" + span(ch.Line, ch.End)
 	if ch.What == "removed" {
 		where = "was L" + span(ch.Line, ch.End)
@@ -388,7 +404,7 @@ func (w *writer) change(ch analyze.Change, ind string, withDetail bool) {
 	if len(notes) > 0 {
 		tail += c.faint + "  (" + strings.Join(notes, "; ") + ")" + c.reset
 	}
-	w.line("%s  %s%-8s%s %s  %s%s%s%s", ind, color, ch.What, c.reset, c.bold+name+c.reset, c.cyan, where, c.reset, tail)
+	w.line("%s  %s%-8s%s %s  %s%s%s%s", ind, color, ch.What, c.reset, c.bold+name+c.reset+marks, c.cyan, where, c.reset, tail)
 	if ch.OldSig != "" {
 		w.line("%s           %swas: %s%s", ind, c.faint, Clip(ch.OldSig, 200), c.reset)
 		w.line("%s           %snow: %s%s", ind, c.faint, Clip(ch.NewSig, 200), c.reset)
@@ -421,7 +437,7 @@ func analyzeLines(n int) string {
 
 // Compact prints one line per file: what happened to which symbols.
 func Compact(files []*analyze.File, o Options) string {
-	w := &writer{c: palette(o.Color)}
+	w := &writer{c: palette(o.Color), mark: o.Mark}
 	shown := min(len(files), max(o.Budget, 1))
 	keep := map[*analyze.File]bool{}
 	ranked := append([]*analyze.File(nil), files...)
@@ -432,7 +448,7 @@ func Compact(files []*analyze.File, o Options) string {
 	var hidden []*analyze.File
 	for _, f := range files {
 		if keep[f] {
-			w.line("%s", o.Indent+compactLine(f, w.c))
+			w.line("%s", o.Indent+w.compactLine(f))
 		} else {
 			hidden = append(hidden, f)
 		}
@@ -451,7 +467,8 @@ func Compact(files []*analyze.File, o Options) string {
 	return w.b.String()
 }
 
-func compactLine(f *analyze.File, c pal) string {
+func (w *writer) compactLine(f *analyze.File) string {
+	c := w.c
 	var b strings.Builder
 	b.WriteString(c.bold + Path(f.Path) + c.reset + "  " + status(f, c, true))
 	var groups []string
@@ -468,6 +485,7 @@ func compactLine(f *analyze.File, c pal) string {
 			if what == "renamed" {
 				n = ch.OldRefName() + " → " + ch.RefName()
 			}
+			n += w.marks(ch.Refs(f.Path)...)
 			var notes []string
 			if ch.OldSig != "" {
 				notes = append(notes, "signature")
@@ -495,7 +513,7 @@ func compactLine(f *analyze.File, c pal) string {
 			groups = append(groups, what+" "+strings.Join(names, ", "))
 		}
 	}
-	if syms := f.Symbols(); len(syms) > 0 {
+	if syms := f.Symbols(w.defMark); len(syms) > 0 {
 		if len(syms) > 6 {
 			syms = append(syms[:6:6], fmt.Sprintf("+%d more", len(syms)-6))
 		}

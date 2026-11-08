@@ -19,6 +19,7 @@ import (
 	"github.com/Vaspyyy/prism/ref"
 	prismrepo "github.com/Vaspyyy/prism/repo" // "repo" is the tests' helper
 	"github.com/Vaspyyy/prism/report"
+	"github.com/Vaspyyy/prism/work"
 	"github.com/Vaspyyy/recap/internal/analyze"
 	"github.com/Vaspyyy/recap/internal/gitx"
 	"github.com/Vaspyyy/recap/internal/render"
@@ -28,7 +29,7 @@ const version = "0.3.0"
 
 type opts struct {
 	staged, patch, agent, noUntracked bool
-	json                              bool
+	json, noContext                   bool
 	show                              string
 	showSet                           bool
 	budget, n                         int
@@ -137,6 +138,8 @@ func parse(args []string) (*opts, int, string) {
 			o.json = true
 		case a == "--no-untracked":
 			o.noUntracked = true
+		case a == "--no-context":
+			o.noContext = true
 		case (a == "--show" || strings.HasPrefix(a, "--show=")) && o.showSet:
 			msg = "--show takes one target; run it once per symbol"
 		case a == "--show":
@@ -192,13 +195,39 @@ func parse(args []string) (*opts, int, string) {
 type cli struct {
 	args   []string
 	json   bool
-	out    *bufio.Writer
+	out    *bufio.Writer // into body
+	body   bytes.Buffer  // the output, until finish prints it
 	detect func() (*prismrepo.Info, error)
 	lim    limiter // --json: the lists' cap, and what it cut
+
+	st   *work.State      // the run's context; nil before it's loaded
+	cur  *gitx.Comparison // the comparison whose symbols are being marked
+	next []report.Next    // the suggestions: next: lines, or the envelope's next
+}
+
+// finish prints the output. The text's context: line comes first, but it
+// can only be written once the body has handed out its marks and notes;
+// the next: lines come last.
+func (c *cli) finish(stdout *bufio.Writer) {
+	c.out.Flush()
+	if !c.json && c.body.Len() > 0 {
+		if line := c.st.Line(); line != "" {
+			stdout.WriteString(line + "\n")
+		}
+	}
+	stdout.Write(c.body.Bytes())
+	if !c.json && len(c.next) > 0 {
+		stdout.WriteString("\n")
+		for _, l := range report.NextLines(c.next) {
+			stdout.WriteString(l + "\n")
+		}
+	}
+	stdout.Flush()
 }
 
 // fail reports a failure and returns the exit code.
 func (c *cli) fail(f *failure) int {
+	c.next = nil
 	if !c.json {
 		fmt.Fprintln(os.Stderr, "recap:", f.msg)
 		return 2
@@ -206,7 +235,7 @@ func (c *cli) fail(f *failure) int {
 	e := c.envelope()
 	l := limiter{max: c.lim.max} // the candidates are all the error shows
 	e.Fail(f.code, f.msg, capped(&l, f.candidates)...)
-	e.Truncated = l.cut
+	e.Truncated, e.Context = l.cut, c.st.Context()
 	report.Write(c.out, e)
 	return 2
 }
@@ -214,7 +243,10 @@ func (c *cli) fail(f *failure) int {
 // emit prints a result as the envelope.
 func (c *cli) emit(res *report.Recap) int {
 	e := c.envelope()
-	e.Result, e.Truncated = res, c.lim.cut
+	e.Result, e.Truncated, e.Context = res, c.lim.cut, c.st.Context()
+	if c.next != nil {
+		e.Next = c.next
+	}
 	report.Write(c.out, e)
 	return 0
 }
@@ -234,14 +266,17 @@ func run(args []string) int {
 		fmt.Print(msg)
 		return 0
 	}
-	c := &cli{args: args, json: jsonFlag(args), out: bufio.NewWriter(os.Stdout), lim: limiter{max: report.MaxItems}}
-	defer c.out.Flush()
+	c := &cli{args: args, json: jsonFlag(args), lim: limiter{max: report.MaxItems}}
+	c.out = bufio.NewWriter(&c.body)
+	defer c.finish(bufio.NewWriter(os.Stdout))
 	c.detect = sync.OnceValues(func() (*prismrepo.Info, error) { return prismrepo.Detect(".") })
-	if c.json {
-		go c.detect() // the envelope names the repository: find it alongside the comparison's git commands
-	}
 	if code > 0 {
 		return c.fail(usage(msg))
+	}
+	if c.json || !work.Disabled(o.noContext) {
+		// the envelope names the repository, and context lives in its git
+		// dir: find it alongside the comparison's git commands
+		go c.detect()
 	}
 	if c.json && o.budgetSet { // the text budget applies to JSON only when given
 		c.lim.max = min(o.budget, report.MaxItems)
@@ -254,6 +289,7 @@ func run(args []string) int {
 	color := human && os.Getenv("NO_COLOR") == ""
 	out := c.out
 	if o.sub == "log" {
+		c.load(o)
 		return c.runLog(top, o, color)
 	}
 	var showRef ref.Ref
@@ -270,6 +306,7 @@ func run(args []string) int {
 			return c.fail(usage(msg))
 		}
 	}
+	c.load(o) // after atRev: "--show name@rev" is recap show rev
 
 	var comp *gitx.Comparison
 	var commit *gitx.Commit
@@ -292,6 +329,7 @@ func run(args []string) int {
 			return c.fail(gitFailure(err))
 		}
 	}
+	c.cur = comp
 	files, contents, err := collect(top, comp, !o.noUntracked && comp.New.Worktree)
 	if err != nil {
 		return c.fail(failed(err.Error()))
@@ -301,8 +339,9 @@ func run(args []string) int {
 		if err != nil {
 			return c.fail(failed(err.Error()))
 		}
-		return c.show(comp, commit, files, contents, info, showRef, o.show, color)
+		return c.show(top, o, view{comp, commit, files, contents}, info, showRef, color)
 	}
+	c.next = suggest(top, o, commit, newSide(files), true)
 	if c.json {
 		res := c.recap(comp, commit)
 		res.Files = c.files(files, files)
@@ -314,6 +353,7 @@ func run(args []string) int {
 				res.Notes = append(res.Notes, "merge in progress: merging "+m+"; resolve the conflicts, then commit (or git merge --abort)")
 			}
 		}
+		c.setFocus(o, comp, commit, files)
 		return c.emit(res)
 	}
 
@@ -335,6 +375,7 @@ func run(args []string) int {
 	}
 	if len(files) == 0 {
 		fmt.Fprintln(out, head+"no changes")
+		c.setFocus(o, comp, commit, files)
 		return 0
 	}
 	fmt.Fprintln(out, bold(head, color)+render.Summary(files, color))
@@ -344,7 +385,14 @@ func run(args []string) int {
 		}
 	}
 	fmt.Fprintln(out)
-	fmt.Fprint(out, render.Files(files, render.Options{Color: color, Budget: o.budget - 2}))
+	// the budget holds the header, the context: line (room for it is kept
+	// with --no-context too, so context never pushes a change out) and the
+	// next: lines
+	reserve := 3
+	if len(c.next) > 0 {
+		reserve += 1 + len(c.next)
+	}
+	fmt.Fprint(out, render.Files(files, render.Options{Color: color, Budget: o.budget - reserve, Mark: c.suffix}))
 	if o.patch {
 		patch, err := gitx.FullDiff(comp, 3, color, nil)
 		if err != nil {
@@ -353,6 +401,7 @@ func run(args []string) int {
 		fmt.Fprintln(out)
 		out.Write(patch)
 	}
+	c.setFocus(o, comp, commit, files)
 	return 0
 }
 
@@ -540,7 +589,8 @@ func (c *cli) runLog(top string, o *opts, color bool) int {
 			res.Range = strings.Join(o.revs, " ")
 		}
 		for _, cm := range capped(&c.lim, commits) {
-			files, _, err := collect(top, gitx.CommitComparison(cm, o.paths), false)
+			c.cur = gitx.CommitComparison(cm, o.paths)
+			files, _, err := collect(top, c.cur, false)
 			if err != nil {
 				return c.fail(failed(err.Error()))
 			}
@@ -566,12 +616,13 @@ func (c *cli) runLog(top string, o *opts, color bool) int {
 				fmt.Fprintln(out, "    "+l)
 			}
 		}
-		files, _, err := collect(top, gitx.CommitComparison(cm, o.paths), false)
+		c.cur = gitx.CommitComparison(cm, o.paths)
+		files, _, err := collect(top, c.cur, false)
 		if err != nil {
 			return c.fail(failed(err.Error()))
 		}
-		per := max(3, o.budget/max(1, len(commits))-2)
-		fmt.Fprint(out, render.Compact(files, render.Options{Color: color, Budget: per, Indent: "  "}))
+		per := max(3, (o.budget-1)/max(1, len(commits))-2) // 1: the context: line
+		fmt.Fprint(out, render.Compact(files, render.Options{Color: color, Budget: per, Indent: "  ", Mark: c.suffix}))
 	}
 	if len(commits) == 0 {
 		fmt.Fprintln(out, "recap log: no commits")
@@ -629,17 +680,31 @@ func candidates(files []*analyze.File) []target {
 }
 
 // show prints the diff of the changed symbols a ref names, or of a file.
-func (c *cli) show(comp *gitx.Comparison, commit *gitx.Commit, files []*analyze.File, contents map[string]pair, info *prismrepo.Info,
-	r ref.Ref, want string, color bool) int {
-	sel, f := pick(comp, files, info, r, want)
+// When nothing in the working tree matches, it shows the match in the
+// focus instead (fill).
+func (c *cli) show(top string, o *opts, v view, info *prismrepo.Info, r ref.Ref, color bool) int {
+	want := o.show
+	sel, f := pick(v.comp, v.files, info, r, want)
+	if f != nil && f.code == report.CodeNoMatch {
+		if fv, fsel, ok := c.fill(top, o, info, r, want); ok {
+			v, sel, f = fv, fsel, nil
+			c.cur = v.comp
+		}
+	}
 	if f != nil {
 		return c.fail(f)
 	}
+	ts := sel.hits
+	if sel.whole != nil {
+		ts = newSide(sel.whole)
+	}
+	c.next = suggest(top, o, v.commit, ts, false)
 	if c.json {
-		res := c.recap(comp, commit)
-		if res.Show, res.Notes, f = c.shows(sel, files, contents); f != nil {
+		res := c.recap(v.comp, v.commit)
+		if res.Show, res.Notes, f = c.shows(sel, v.files, v.contents); f != nil {
 			return c.fail(f)
 		}
+		c.setFocus(o, v.comp, v.commit, v.files)
 		return c.emit(res)
 	}
 	out := c.out
@@ -647,7 +712,11 @@ func (c *cli) show(comp *gitx.Comparison, commit *gitx.Commit, files []*analyze.
 		fmt.Fprintln(out, sel.note)
 	}
 	if sel.whole != nil {
-		return c.showFiles(sel.whole, contents, want, color)
+		if code := c.showFiles(sel.whole, v.contents, want, color); code != 0 {
+			return code
+		}
+		c.setFocus(o, v.comp, v.commit, v.files)
+		return 0
 	}
 	if len(sel.hits) > 1 {
 		fmt.Fprintf(out, "%d matches for %s\n\n", len(sel.hits), strconv.Quote(want))
@@ -656,8 +725,9 @@ func (c *cli) show(comp *gitx.Comparison, commit *gitx.Commit, files []*analyze.
 		if k > 0 {
 			fmt.Fprintln(out)
 		}
-		printSymbol(out, t, color)
+		printSymbol(out, t, c.suffix(t.ch.Refs(t.f.Path)...), color)
 	}
+	c.setFocus(o, v.comp, v.commit, v.files)
 	return 0
 }
 
@@ -979,8 +1049,9 @@ func fileMiss(info *prismrepo.Info, p, cwd string, comp *gitx.Comparison) string
 }
 
 // printSymbol prints one symbol's diff: against its old version, or against
-// where its body came from (a move or an extraction).
-func printSymbol(out *bufio.Writer, t target, color bool) {
+// where its body came from (a move or an extraction). marks are printed
+// after its name.
+func printSymbol(out *bufio.Writer, t target, marks string, color bool) {
 	ch := t.ch
 	where := render.Path(t.f.Path) + " L" + render.Span(ch.Line, ch.End)
 	against := ""
@@ -1001,7 +1072,7 @@ func printSymbol(out *bufio.Writer, t target, color bool) {
 	if ch.What == "renamed" {
 		label = render.Label(ch.Kind, ch.OldRefName()) + " → " + ch.RefName()
 	}
-	fmt.Fprintf(out, "%s%s %s%s  (%s)\n", onOff(color, true), ch.What, label, onOff(color, false), where)
+	fmt.Fprintf(out, "%s%s %s%s%s  (%s)\n", onOff(color, true), ch.What, label, onOff(color, false), marks, where)
 	if against != "" {
 		fmt.Fprintln(out, "  "+against+":")
 	}
