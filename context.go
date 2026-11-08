@@ -57,11 +57,11 @@ func (c *cli) load(o *opts) {
 
 var markOrder = []string{work.MarkChanged, work.MarkBranch, work.MarkFocus, work.MarkFailing}
 
-// marks are the context marks of a symbol recap prints, by its refs (a
-// rename's new ref and its old one), counted as shown. On the focus's own
-// comparison [focus] is left out: every symbol there is in the focus, so
-// the mark would say nothing.
-func (c *cli) marks(refs ...string) []string {
+// peek is the context marks of a symbol, by its refs (a rename's new ref
+// and its old one), not counted as shown. On the focus's own comparison
+// [focus] is left out: every symbol there is in the focus, so the mark
+// would say nothing.
+func (c *cli) peek(refs ...string) []string {
 	st := c.st
 	if st == nil {
 		return nil
@@ -77,8 +77,14 @@ func (c *cli) marks(refs ...string) []string {
 		}
 	}
 	slices.SortStableFunc(out, func(a, b string) int { return slices.Index(markOrder, a) - slices.Index(markOrder, b) })
-	st.Show(out...)
 	return out
+}
+
+// marks is peek for a symbol recap prints: the marks count as shown.
+func (c *cli) marks(refs ...string) []string {
+	m := c.peek(refs...)
+	c.st.Show(m...)
+	return m
 }
 
 // suffix is marks as printed after a name: " [failing]", or "".
@@ -110,7 +116,10 @@ func focusRange(o *opts, commit *gitx.Commit) string {
 
 // focusSymbols are the refs of the changed symbols on the new side, as
 // recap prints them: changed, added and renamed ones, and the definitions
-// of new files. Removed ones aren't there any more.
+// of new files. Removed ones aren't there any more. An added or renamed
+// symbol brings the definitions inside it (a class's methods): they're new
+// too, or renamed with it, and seek and crux name a location by the
+// innermost symbol containing it.
 func focusSymbols(files []*analyze.File) []string {
 	out := []string{}
 	seen := map[string]bool{}
@@ -121,9 +130,20 @@ func focusSymbols(files []*analyze.File) []string {
 		}
 	}
 	for _, f := range files {
+		var refs []ref.Ref // the new side's refs, when a symbol needs its members
 		for _, ch := range f.Changes {
-			if ch.What == "changed" || ch.What == "added" || ch.What == "renamed" {
-				add(ch.Refs(f.Path)[0])
+			if ch.What != "changed" && ch.What != "added" && ch.What != "renamed" {
+				continue
+			}
+			add(ch.Refs(f.Path)[0])
+			if ch.What == "changed" {
+				continue // its changed members are changes of their own
+			}
+			if refs == nil {
+				refs = ref.Refs(ref.Targets(f.Path, f.NewSyms))
+			}
+			for _, j := range members(f.NewSyms, ch.Name, ch.Line) {
+				add(refs[j].String())
 			}
 		}
 		if f.Status != 'D' {
@@ -135,27 +155,41 @@ func focusSymbols(files []*analyze.File) []string {
 	return out
 }
 
-// focusComparison is the comparison the focus records, by its commits.
+// members are the indexes of the definitions inside the one named name at
+// line in syms, nested ones included.
+func members(syms []outline.Symbol, name string, line int) []int {
+	top := -1
+	for i, s := range syms {
+		if s.Line == line && outline.Qualified(syms, i) == name {
+			top = i
+			break
+		}
+	}
+	var out []int
+	if top < 0 {
+		return out
+	}
+	for j := range syms {
+		for p := syms[j].Parent; p >= 0; p = syms[p].Parent {
+			if p == top {
+				out = append(out, j)
+				break
+			}
+		}
+	}
+	return out
+}
+
+// focusComparison is the comparison the focus records, by its commits. Its
+// sides are named by their short ids: a range's names may have moved on
+// since the focus was written.
 func focusComparison(f *focus.Focus, paths []string) *gitx.Comparison {
 	c := &gitx.Comparison{Old: gitx.Side{Rev: f.Old, Label: f.Old[:min(len(f.Old), 7)]}, New: gitx.Side{Rev: f.New, Label: f.New[:min(len(f.New), 7)]},
 		DiffArgs: []string{f.Old, f.New}, Paths: paths}
-	sides := func(sep string) (string, string) {
-		a, b, _ := strings.Cut(f.Range, sep)
-		if a == "" {
-			a = "HEAD"
-		}
-		if b == "" {
-			b = "HEAD"
-		}
-		return a, b
-	}
 	switch {
 	case strings.Contains(f.Range, "..."):
-		a, b := sides("...")
-		c.Old.Label, c.Old.Base, c.New.Label = "the branch point", true, b
-		c.Desc = fmt.Sprintf("%s since it branched off %s (at %s)", b, a, f.Old[:min(len(f.Old), 9)])
+		c.Old.Base = true // the merge base
 	case strings.Contains(f.Range, ".."):
-		c.Old.Label, c.New.Label = sides("..")
 	case f.Old == gitx.EmptyTree():
 		c.Old.Label, c.Old.Empty = "nothing", true
 	default:
@@ -204,35 +238,37 @@ func (c *cli) fill(top string, o *opts, info *prismrepo.Info, r ref.Ref, want st
 	return v, sel, true
 }
 
-// suggest returns the next: lines for a result: seek for its most
-// significant changed symbol that exists in the working tree (seek
-// searches the working tree, so a symbol that's gone there would find
-// nothing), and with diffs set, recap --show for the most significant one
-// when the overview can't show its changed lines inline.
-func suggest(top string, o *opts, commit *gitx.Commit, ts []target, diffs bool) []report.Next {
-	ranked := significant(ts)
-	var next []report.Next
+// seekNext is the next: line for seek on the most significant of the
+// ranked symbols that exists in the working tree: seek searches the
+// working tree, so a symbol that's gone there would find nothing.
+func seekNext(top string, ranked []target) []report.Next {
 	have := map[string][]string{}
 	for i, t := range ranked {
 		if i == 20 {
 			break
 		}
 		if r := t.ref(); inWorktree(top, t.f.Path, r, have) {
-			next = append(next, report.Next{Cmd: report.Cmd("seek", r), Why: "definition and uses by name"})
-			break
+			return []report.Next{{Cmd: report.Cmd("seek", r), Why: "definition and uses by name"}}
 		}
 	}
-	if !diffs {
-		return next
-	}
+	return nil
+}
+
+// showNext is the next: line for recap --show on the most significant of
+// the ranked symbols whose change the overview didn't show: its changed
+// lines weren't printed inline (inline holds inlineKey of those that were).
+func showNext(o *opts, commit *gitx.Commit, ranked []target, inline map[string]bool) []report.Next {
 	for _, t := range ranked {
-		if hasDiff(t.ch) && !shownInline(t.ch) {
+		if hasDiff(t.ch) && !inline[inlineKey(t.f.Path, t.ch)] {
 			args := append(append([]string{"recap"}, revArgs(o, commit)...), "--show", t.ref())
-			next = append(next, report.Next{Cmd: report.Cmd(args...), Why: "its diff"})
-			break
+			return []report.Next{{Cmd: report.Cmd(args...), Why: "its diff"}}
 		}
 	}
-	return next
+	return nil
+}
+
+func inlineKey(path string, ch analyze.Change) string {
+	return fmt.Sprintf("%s\x00%s\x00%s\x00%d", path, ch.What, ch.Name, ch.Line)
 }
 
 // hasDiff reports whether --show prints a diff for the symbol, rather than
@@ -248,13 +284,9 @@ func hasDiff(ch analyze.Change) bool {
 	return false
 }
 
-// shownInline reports whether the overview shows all of a change: its
-// changed lines inline (analyze keeps them only when they all fit), or
-// only its signature changed, which the was: and now: lines show.
-func shownInline(ch analyze.Change) bool {
-	if len(ch.Detail) > 0 {
-		return true
-	}
+// sigOnly reports whether only a change's signature changed, which its
+// was: and now: lines show in full.
+func sigOnly(ch analyze.Change) bool {
 	if ch.OldSig == "" {
 		return false
 	}
@@ -269,6 +301,41 @@ func shownInline(ch analyze.Change) bool {
 		}
 	}
 	return true
+}
+
+// overview renders the overview, with room for next next: lines besides
+// it, and says which changes it showed in full: with their changed lines,
+// a signature-only change with its was: and now: lines, or a rename that
+// changed nothing else. record counts the marks it prints as shown.
+func (c *cli) overview(files []*analyze.File, o *opts, color bool, next int, record bool) (string, map[string]bool) {
+	inline := map[string]bool{}
+	ro := render.Options{Color: color, Budget: o.budget - 2, Marks: c.peek, Printed: func(path string, ch analyze.Change, detail bool) {
+		if detail || sigOnly(ch) || ch.RenameOnly() {
+			inline[inlineKey(path, ch)] = true
+		}
+	}}
+	if next > 0 {
+		ro.Extra = 1 + next // a blank line, then the next: lines
+	}
+	if record {
+		ro.Shown = func(m []string) { c.st.Show(m...) }
+	}
+	return render.Files(files, ro), inline
+}
+
+// suggestions are the overview's next: lines, and its text with room for
+// them. The --show line depends on what the overview could show inline,
+// and its room on the lines: with a --show line the overview is planned
+// once more, which can only show less inline, so the line stays.
+func (c *cli) suggestions(top string, o *opts, commit *gitx.Commit, files []*analyze.File, color, record bool) ([]report.Next, string) {
+	ranked := significant(newSide(files))
+	next := seekNext(top, ranked)
+	text, inline := c.overview(files, o, color, len(next), record)
+	if show := showNext(o, commit, ranked, inline); show != nil {
+		text, inline = c.overview(files, o, color, len(next)+1, record)
+		next = append(next, showNext(o, commit, ranked, inline)...)
+	}
+	return next, text
 }
 
 // significant orders the targets worth a suggestion, most significant

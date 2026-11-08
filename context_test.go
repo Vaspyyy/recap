@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -279,13 +280,27 @@ func TestShowFillsFromFocus(t *testing.T) {
 	}
 }
 
-// A focus on a range is named as the range was given.
+// A fill-in from a range names the range and the commits it resolved to:
+// HEAD may have moved on since, and the run must be repeatable from the
+// note alone (Prism's docs/context.md, rule 4).
 func TestShowFillsFromFocusRange(t *testing.T) {
 	filesRepo(t)
 	recap(t, "HEAD~1..HEAD")
-	if out, code := recap(t, "--show", "List"); code != 0 ||
-		!strings.HasPrefix(out, "context: nothing matches in the working tree; showing focus HEAD~1..HEAD\nchanged func List") {
-		t.Errorf("exit %d\n%s", code, out)
+	old, new := gitOut(t, "rev-parse", "--short", "HEAD~1"), gitOut(t, "rev-parse", "--short", "HEAD")
+	os.WriteFile("notes.txt", []byte("later\n"), 0o644) // HEAD moves on; the branch, and so the focus, stay
+	gitOut(t, "add", "notes.txt")
+	gitOut(t, "-c", "user.name=Ada", "-c", "user.email=ada@example.com", "commit", "-q", "-m", "later")
+
+	out, code := recap(t, "--show", "List")
+	note := "context: nothing matches in the working tree; showing focus HEAD~1..HEAD (" + old + ".." + new + ")\n"
+	if code != 0 || !strings.HasPrefix(out, note+"changed func List") {
+		t.Fatalf("exit %d\n%s", code, out)
+	}
+	if again, _ := recap(t, old+".."+new, "--show", "List", "--no-context"); again != strings.TrimPrefix(out, note) {
+		t.Errorf("recap %s..%s --show List isn't what the fill-in showed:\n%s\nvs\n%s", old, new, again, out)
+	}
+	if _, errs, code := recapAll(t, "HEAD~1..HEAD", "--show", "List", "--no-context"); code != 2 || !strings.Contains(errs, "nothing changed matches") {
+		t.Errorf("HEAD~1..HEAD has moved on and doesn't hold List's change any more: exit %d, %s", code, errs)
 	}
 }
 
@@ -335,21 +350,159 @@ func TestNoContextIsTheSameMinusContext(t *testing.T) {
 	recap(t, "show", id) // a focus
 	store(t).SetLastRun("crux", focus.LastRun{Cmd: "go test ./...", Exit: 1, In: []string{"internal/files/files.go:List", "internal/files/files.go:run"}})
 	os.WriteFile("internal/files/files.go", []byte(strings.Replace(gitOut(t, "show", "HEAD:internal/files/files.go")+"\n", "return len(List(args))", "return len(List(args)) + 0", 1)), 0o644)
-	marks := regexp.MustCompile(` \[(changed|branch|focus|failing)\]`)
 	for _, args := range [][]string{{"show", id}, {}, {"log"}, {"HEAD~1"}, {"--show", "run"}, {"--show", "List@" + id}} {
-		on, code := recap(t, args...)
-		off, codeOff := recap(t, append(args, "--no-context")...)
-		if !strings.HasPrefix(on, "context: ") || !marks.MatchString(on) {
-			t.Errorf("recap %v: no context used, nothing to compare:\n%s", args, on)
+		sameMinusContext(t, args...)
+	}
+}
+
+var marksRe = regexp.MustCompile(` \[(changed|branch|focus|failing)\]`)
+
+// sameMinusContext checks that a run that used context prints what it
+// prints with --no-context, plus a context: line and marks.
+func sameMinusContext(t *testing.T, args ...string) {
+	t.Helper()
+	on, code := recap(t, args...)
+	off, codeOff := recap(t, append(args, "--no-context")...)
+	if !strings.HasPrefix(on, "context: ") || !marksRe.MatchString(on) {
+		t.Errorf("recap %v: no context used, nothing to compare:\n%s", args, on)
+	}
+	_, rest, _ := strings.Cut(on, "\n")
+	if code != codeOff || marksRe.ReplaceAllString(rest, "") != off {
+		t.Errorf("recap %v: with context minus the context: line and marks:\n%s\n--no-context:\n%s", args, marksRe.ReplaceAllString(rest, ""), off)
+	}
+	if d, _, _ := recapJSON(t, append(args, "--no-context")...); d.Context != nil {
+		t.Errorf("recap --json %v --no-context: context %+v, want null", args, d.Context)
+	}
+}
+
+// Context only marks: a marked overload stays merged with its twin (else
+// the split pushes another name past the cap), and a name cut into "+N
+// more" gets no mark nobody can see, so no context: line names its layer.
+func TestMarksDontChangeTheLists(t *testing.T) {
+	write, commit := contextRepo(t)
+	write("README", "x\n")
+	commit("first")
+	var cpp, g strings.Builder
+	cpp.WriteString("int add(int a, int b) {\n  return a + b;\n}\ndouble add(double a, double b) {\n  return a + b;\n}\n")
+	g.WriteString("package a\n\n")
+	for i := 1; i <= 7; i++ {
+		fmt.Fprintf(&cpp, "int f%d() {\n  return %d;\n}\n", i, i)
+	}
+	for i := 1; i <= 10; i++ {
+		fmt.Fprintf(&g, "func F%02d() int {\n\treturn %d\n}\n\n", i, i)
+	}
+	write("a.cpp", cpp.String())
+	write("a.go", g.String())
+	commit("second")
+	failing := func(refs ...string) {
+		t.Helper()
+		if err := store(t).SetLastRun("crux", focus.LastRun{Cmd: "go test ./...", Exit: 1, In: refs}); err != nil {
+			t.Fatal(err)
 		}
-		_, rest, _ := strings.Cut(on, "\n")
-		if code != codeOff || marks.ReplaceAllString(rest, "") != off {
-			t.Errorf("recap %v: with context minus the context: line and marks:\n%s\n--no-context:\n%s", args, marks.ReplaceAllString(rest, ""), off)
+	}
+
+	failing("a.cpp:add#2")
+	if out, _ := recap(t, "show"); !strings.Contains(out, "\na.cpp  new, 27 lines: func add [failing] ×2, func f1, func f2, func f3, func f4, func f5, func f6, func f7\n") {
+		t.Errorf("recap show: a marked overload must stay merged, and f7 listed:\n%s", out)
+	}
+	if out, _ := recap(t, "log", "-n", "1"); !strings.Contains(out, "\n  a.cpp  new, 27 lines: func add [failing] ×2, func f1, func f2, func f3, func f4, func f5, +2 more\n") {
+		t.Errorf("recap log: a marked overload must stay merged, and f5 listed:\n%s", out)
+	}
+	sameMinusContext(t, "show")
+	sameMinusContext(t, "log", "-n", "1")
+
+	failing("a.go:F10") // a.go's line names F01 to F08, then "+2 more"
+	for _, args := range [][]string{{"show"}, {"log", "-n", "1"}} {
+		if out, _ := recap(t, args...); strings.HasPrefix(out, "context:") || strings.Contains(out, "[failing]") {
+			t.Errorf("recap %v: F10 isn't printed, so nothing says it failed:\n%s", args, out)
 		}
-		d, _, _ := recapJSON(t, append(args, "--no-context")...)
-		if d.Context != nil {
-			t.Errorf("recap --json %v --no-context: context %+v, want null", args, d.Context)
+	}
+	// JSON lists every definition, F10 with its mark
+	d, res, _ := recapJSON(t, "show")
+	if m := fileByPath(t, res.Files, "a.go").Defs[9].Symbol; m.Ref != "a.go:F10" || !reflect.DeepEqual(m.Marks, []string{"failing"}) || !slices.Contains(d.Context.Applied, "mark") {
+		t.Errorf("JSON: %+v, context %+v", m, d.Context)
+	}
+}
+
+// Members of a symbol added to an existing file are in the focus with it:
+// seek and crux name a location by the innermost symbol containing it.
+func TestFocusHasMembers(t *testing.T) {
+	write, commit := contextRepo(t)
+	shop := "def checkout():\n    return 1\n"
+	write("shop.py", shop)
+	commit("first")
+	cart := shop + "\n\nclass Cart:\n    def total(self):\n        return 2\n\n    def tax(self):\n        return 3\n"
+	write("shop.py", cart)
+	commit("cart")
+	recap(t, "show")
+	if f := store(t).Focus(); f == nil || !reflect.DeepEqual(f.Symbols, []string{"shop.py:Cart", "shop.py:Cart.total", "shop.py:Cart.tax"}) || f.Total != 3 {
+		t.Errorf("added class: focus %+v", f)
+	}
+	// renamed with it
+	write("shop.py", strings.Replace(cart, "class Cart:", "class Basket:", 1))
+	commit("rename")
+	out, _ := recap(t, "show")
+	if f := store(t).Focus(); f == nil || !reflect.DeepEqual(f.Symbols, []string{"shop.py:Basket", "shop.py:Basket.total", "shop.py:Basket.tax"}) {
+		t.Errorf("renamed class: focus %+v", f)
+	}
+	// the overview says all of a rename that changed nothing else: no --show line
+	if next := nextLines(out); !reflect.DeepEqual(next, []string{"next: seek shop.py:Basket   definition and uses by name"}) {
+		t.Errorf("next: %q in\n%s", next, out)
+	}
+}
+
+// Context and next: lines may cost detail (changed lines shown inline),
+// never a listed change (Prism's docs/output.md, rule 5). The counts are
+// what recap 0.3.0 listed, before context.
+func TestContextCostsOnlyDetail(t *testing.T) {
+	write, commit := contextRepo(t)
+	var v1 strings.Builder
+	v1.WriteString("package a\n\n")
+	for i := range 20 {
+		fmt.Fprintf(&v1, "func F%02d(x int) int {\n\treturn x + %d\n}\n\n", i, i)
+	}
+	write("a.go", v1.String())
+	commit("first")
+	store(t).SetLastRun("crux", focus.LastRun{Cmd: "go test ./...", Exit: 1, In: []string{"a.go:F00", "a.go:F01"}})
+	count := func(out, what string) int {
+		n := 0
+		for _, l := range strings.Split(out, "\n") {
+			if strings.HasPrefix(l, "  "+what+" ") {
+				n++
+			}
 		}
+		return n
+	}
+
+	// only removals: no detail to give up, so the context: line goes on top
+	write("a.go", "package a\n")
+	on, _ := recap(t, "-b", "13")
+	off, _ := recap(t, "-b", "13", "--no-context")
+	if !strings.HasPrefix(on, "context: ") || count(on, "removed") != 10 || count(off, "removed") != 10 {
+		t.Errorf("-b 13: %d removals listed with context, %d without, want 10:\n%s", count(on, "removed"), count(off, "removed"), on)
+	}
+
+	// small changes: the next: lines and the context: line take the room
+	// of their changed lines, and then the overview hasn't shown F00's
+	// change, so --show is suggested
+	write("a.go", strings.ReplaceAll(v1.String(), "return x + ", "return x - "))
+	diff := report.Next{Cmd: "recap --show a.go:F00", Why: "its diff"}
+	seek := report.Next{Cmd: "seek a.go:F00", Why: "definition and uses by name"}
+	for _, args := range [][]string{{"-b", "16"}, {"-b", "16", "--no-context"}} {
+		out, _ := recap(t, args...)
+		if count(out, "changed") != 13 || strings.Contains(out, "           - return") || !reflect.DeepEqual(nextLines(out), report.NextLines([]report.Next{seek, diff})) {
+			t.Errorf("recap %v: %d changes listed, want 13, and next: seek and --show:\n%s", args, count(out, "changed"), out)
+		}
+	}
+	// with room, every change shows its lines: no --show
+	if out, _ := recap(t); count(out, "changed") != 20 || !strings.Contains(out, "+ return x - 19") ||
+		!reflect.DeepEqual(nextLines(out), report.NextLines([]report.Next{seek})) {
+		t.Errorf("recap: all 20 changes with their lines, next: seek only:\n%s", out)
+	}
+	// a mark on a change cut by the budget isn't printed, nor named
+	store(t).SetLastRun("crux", focus.LastRun{Cmd: "go test ./...", Exit: 1, In: []string{"a.go:F19"}})
+	if out, _ := recap(t, "-b", "16"); strings.HasPrefix(out, "context:") || strings.Contains(out, "[failing]") {
+		t.Errorf("F19 isn't listed at -b 16, so nothing says it failed:\n%s", out)
 	}
 }
 

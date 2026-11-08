@@ -341,7 +341,10 @@ func run(args []string) int {
 		}
 		return c.show(top, o, view{comp, commit, files, contents}, info, showRef, color)
 	}
-	c.next = suggest(top, o, commit, newSide(files), true)
+	var overview string // planned with the next: lines, which can only take room from detail
+	if len(files) > 0 {
+		c.next, overview = c.suggestions(top, o, commit, files, color, !c.json)
+	}
 	if c.json {
 		res := c.recap(comp, commit)
 		res.Files = c.files(files, files)
@@ -385,14 +388,7 @@ func run(args []string) int {
 		}
 	}
 	fmt.Fprintln(out)
-	// the budget holds the header, the context: line (room for it is kept
-	// with --no-context too, so context never pushes a change out) and the
-	// next: lines
-	reserve := 3
-	if len(c.next) > 0 {
-		reserve += 1 + len(c.next)
-	}
-	fmt.Fprint(out, render.Files(files, render.Options{Color: color, Budget: o.budget - reserve, Mark: c.suffix}))
+	fmt.Fprint(out, overview)
 	if o.patch {
 		patch, err := gitx.FullDiff(comp, 3, color, nil)
 		if err != nil {
@@ -621,8 +617,9 @@ func (c *cli) runLog(top string, o *opts, color bool) int {
 		if err != nil {
 			return c.fail(failed(err.Error()))
 		}
-		per := max(3, (o.budget-1)/max(1, len(commits))-2) // 1: the context: line
-		fmt.Fprint(out, render.Compact(files, render.Options{Color: color, Budget: per, Indent: "  ", Mark: c.suffix}))
+		per := max(3, o.budget/max(1, len(commits))-2) // no detail to give up: a context: line goes on top
+		fmt.Fprint(out, render.Compact(files, render.Options{Color: color, Budget: per, Indent: "  ", Marks: c.peek,
+			Shown: func(m []string) { c.st.Show(m...) }}))
 	}
 	if len(commits) == 0 {
 		fmt.Fprintln(out, "recap log: no commits")
@@ -698,7 +695,7 @@ func (c *cli) show(top string, o *opts, v view, info *prismrepo.Info, r ref.Ref,
 	if sel.whole != nil {
 		ts = newSide(sel.whole)
 	}
-	c.next = suggest(top, o, v.commit, ts, false)
+	c.next = seekNext(top, significant(ts))
 	if c.json {
 		res := c.recap(v.comp, v.commit)
 		if res.Show, res.Notes, f = c.shows(sel, v.files, v.contents); f != nil {

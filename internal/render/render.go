@@ -24,28 +24,55 @@ type Options struct {
 	Color  bool
 	Budget int // lines, roughly
 	Indent string
-	// Mark, if not nil, gives the context marks printed after a symbol's
-	// name (" [failing]"), by its refs (a rename's new ref, then its old one).
-	Mark func(refs ...string) string
+
+	// Extra is how many lines are printed besides the overview (next:
+	// lines). Like the context: line, which a printed mark brings along,
+	// they take room only from changed lines shown inline, never from a
+	// listed change; without such detail to give up they go on top of the
+	// budget (Prism's docs/output.md, rule 5).
+	Extra int
+	// Marks, if not nil, gives a symbol's context marks by its refs (a
+	// rename's new ref, then its old one), without counting them as shown:
+	// the overview asks while it plans, and prints them after the name.
+	Marks func(refs ...string) []string
+	// Shown, if not nil, is told the marks of each name the overview prints.
+	Shown func(marks []string)
+	// Printed, if not nil, is told each change the overview lists, and
+	// whether its changed lines are shown inline with it.
+	Printed func(path string, ch analyze.Change, detail bool)
 }
 
 type writer struct {
 	b     strings.Builder
 	c     pal
 	lines int
-	mark  func(refs ...string) string
+	o     Options
 }
 
-// marks is the marks suffix for a symbol's refs, or "" without Options.Mark.
-func (w *writer) marks(refs ...string) string {
-	if w.mark == nil {
-		return ""
+// peek is a symbol's marks, not counted as shown.
+func (w *writer) peek(refs ...string) []string {
+	if w.o.Marks == nil {
+		return nil
 	}
-	return w.mark(refs...)
+	return w.o.Marks(refs...)
 }
 
-// defMark is Options.Mark for one ref, as analyze.File.Symbols takes it.
-func (w *writer) defMark(ref string) string { return w.marks(ref) }
+// marks is the suffix printed after a symbol's name (" [failing]"), or "";
+// the marks count as shown.
+func (w *writer) marks(refs ...string) string {
+	ms := w.peek(refs...)
+	if len(ms) > 0 && w.o.Shown != nil {
+		w.o.Shown(ms)
+	}
+	var b strings.Builder
+	for _, m := range ms {
+		b.WriteString(" [" + m + "]")
+	}
+	return b.String()
+}
+
+// listedEntries is how many of a file's definitions its line names.
+const listedEntries = 8
 
 func (w *writer) line(format string, a ...any) {
 	fmt.Fprintf(&w.b, format+"\n", a...)
@@ -139,7 +166,7 @@ func importance(ch analyze.Change) int {
 // then each file a few of its most important changes, then the rest in
 // file order.
 func Files(files []*analyze.File, o Options) string {
-	w := &writer{c: palette(o.Color), mark: o.Mark}
+	w := &writer{c: palette(o.Color), o: o}
 	room := max(o.Budget, 10)
 	shownFiles := min(len(files), max(room, 30))
 	room -= shownFiles
@@ -164,6 +191,12 @@ func Files(files []*analyze.File, o Options) string {
 				room -= give
 			}
 		}
+	}
+	// lines printed besides the overview take their room from what's left,
+	// which is for detail only: the listed changes are planned already
+	room -= o.Extra
+	if w.anyMarks(files[:shownFiles], ordered, quota) {
+		room-- // the context: line
 	}
 	// what's left goes to the changed lines of small changes, most important first
 	details := map[string]bool{}
@@ -195,6 +228,41 @@ func Files(files []*analyze.File, o Options) string {
 		w.line("%s… and %s not shown: %s%s (raise -b to see them)", o.Indent, plural(n, "more file"), strings.Join(names, ", "), more)
 	}
 	return w.b.String()
+}
+
+// listed is how many of a file's changes (in their order) fit its quota,
+// and the lines they take.
+func listed(changes []analyze.Change, quota int) (n, used int) {
+	for _, ch := range changes {
+		if used+changeLines(ch) > quota {
+			break
+		}
+		used += changeLines(ch)
+		n++
+	}
+	return n, used
+}
+
+// anyMarks reports whether a name the overview will print has marks.
+func (w *writer) anyMarks(files []*analyze.File, ordered [][]analyze.Change, quota []int) bool {
+	if w.o.Marks == nil {
+		return false
+	}
+	for i, f := range files {
+		entries := f.Entries()
+		for _, e := range entries[:min(len(entries), listedEntries)] {
+			if len(w.peek(e.Refs...)) > 0 {
+				return true
+			}
+		}
+		n, _ := listed(ordered[i], quota[i])
+		for _, ch := range ordered[i][:n] {
+			if len(w.peek(ch.Refs(f.Path)...)) > 0 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func changeLines(ch analyze.Change) int {
@@ -285,26 +353,21 @@ func topLine(f *analyze.File) bool {
 func (w *writer) file(f *analyze.File, changes []analyze.Change, quota int, ind string, details map[string]bool) {
 	c := w.c
 	line := ind + c.bold + Path(f.Path) + c.reset + "  " + status(f, c, false)
-	if syms := f.Symbols(w.defMark); len(syms) > 0 {
-		extra := ""
-		if len(syms) > 8 {
-			syms, extra = syms[:8], fmt.Sprintf(" +%d more", len(syms)-8)
-		}
-		line += ": " + c.faint + strings.Join(syms, ", ") + extra + c.reset
+	if syms := w.entries(f, listedEntries); len(syms) > 0 {
+		line += ": " + c.faint + strings.Join(syms, ", ") + c.reset
 	}
 	if len(f.Changes) == 0 && len(f.TopLines) > 0 && !f.Untracked && f.Status != 'A' && f.Status != 'D' {
 		line += ": " + c.faint + strings.Join(clipAll(f.TopLines, 80), "  ") + c.reset
 	}
 	w.line("%s", line)
 
-	used, shown := 0, 0
-	for _, ch := range changes {
-		if used+changeLines(ch) > quota {
-			break
+	shown, used := listed(changes, quota)
+	for _, ch := range changes[:shown] {
+		detail := details[detailKey(f, ch)] && len(ch.Detail) > 0
+		w.change(f.Path, ch, ind, detail)
+		if w.o.Printed != nil {
+			w.o.Printed(f.Path, ch, detail)
 		}
-		w.change(f.Path, ch, ind, details[detailKey(f, ch)])
-		used += changeLines(ch)
-		shown++
 	}
 	topShown := false
 	if topLine(f) && used < quota {
@@ -327,6 +390,21 @@ func (w *writer) file(f *analyze.File, changes []analyze.Change, quota int, ind 
 	} else if !topShown && f.TopReal && len(f.Changes) > 0 {
 		w.line("%s  %s… and lines outside definitions %s%s", ind, c.faint, Counts(f.TopPlus, f.TopMinus, pal{}), c.reset)
 	}
+}
+
+// entries are the names of a new or deleted file's definitions as its line
+// prints them, at most max and then "+N more". Only printed names get
+// their marks.
+func (w *writer) entries(f *analyze.File, max int) []string {
+	all := f.Entries()
+	var out []string
+	for _, e := range all[:min(len(all), max)] {
+		out = append(out, e.Text(w.marks(e.Refs...)))
+	}
+	if len(all) > max {
+		out = append(out, fmt.Sprintf("+%d more", len(all)-max))
+	}
+	return out
 }
 
 // summarize counts left-out changes by kind: "2846 changed (each +1 −1), 10 removed".
@@ -437,7 +515,7 @@ func analyzeLines(n int) string {
 
 // Compact prints one line per file: what happened to which symbols.
 func Compact(files []*analyze.File, o Options) string {
-	w := &writer{c: palette(o.Color), mark: o.Mark}
+	w := &writer{c: palette(o.Color), o: o}
 	shown := min(len(files), max(o.Budget, 1))
 	keep := map[*analyze.File]bool{}
 	ranked := append([]*analyze.File(nil), files...)
@@ -473,11 +551,14 @@ func (w *writer) compactLine(f *analyze.File) string {
 	b.WriteString(c.bold + Path(f.Path) + c.reset + "  " + status(f, c, true))
 	var groups []string
 	for _, what := range []string{"changed", "renamed", "moved", "added", "removed"} {
-		var names []string
+		var group []analyze.Change
 		for _, ch := range f.Changes {
-			if ch.What != what {
-				continue
+			if ch.What == what {
+				group = append(group, ch)
 			}
+		}
+		var names []string
+		for _, ch := range group[:min(len(group), 6)] { // only printed names get their marks
 			n := ch.RefName()
 			if strings.HasPrefix(ch.Kind, "h") && len(ch.Kind) == 2 {
 				n = Label(ch.Kind, ch.RefName())
@@ -506,17 +587,14 @@ func (w *writer) compactLine(f *analyze.File) string {
 			}
 			names = append(names, n) // a Rust struct and its impl block differ by "#N"
 		}
-		if len(names) > 6 {
-			names = append(names[:6], fmt.Sprintf("+%d more", len(names)-6))
+		if len(group) > 6 {
+			names = append(names, fmt.Sprintf("+%d more", len(group)-6))
 		}
 		if len(names) > 0 {
 			groups = append(groups, what+" "+strings.Join(names, ", "))
 		}
 	}
-	if syms := f.Symbols(w.defMark); len(syms) > 0 {
-		if len(syms) > 6 {
-			syms = append(syms[:6:6], fmt.Sprintf("+%d more", len(syms)-6))
-		}
+	if syms := w.entries(f, 6); len(syms) > 0 {
 		groups = append(groups, strings.Join(syms, ", "))
 	}
 	if f.TopImports && len(f.Changes) > 0 {

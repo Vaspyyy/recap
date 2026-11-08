@@ -61,6 +61,7 @@ recap shares context with glint, seek and crux through [Prism](https://github.co
 - `recap --show NAME` on the working tree, when nothing there matches, shows the match in the focus instead: `context: nothing matches in the working tree; showing focus commit b681ef1`. With a revision, `--staged` or a line location it never does.
 - Changed symbols that failed in crux's last run are marked `[failing]`, and working-tree changes to symbols the focus changed are marked `[focus]`. A first `context:` line names what the marks come from.
 - `next:` lines at the bottom suggest `seek <ref>` for the most significant changed symbol that still exists in the working tree (seek searches the working tree), and `recap … --show <ref>` when the overview couldn't show that change inline. They come from the result, not from context.
+- The `context:` and `next:` lines fit the budget only by giving up changed lines shown inline, never a listed change; with nothing to give up they go on top.
 
 The focus is kept in the git dir (`.git/prism/`), per worktree and agent session, and expires after an hour. `--no-context` or `PRISM_NO_CONTEXT=1` neither reads nor records anything: the output then depends only on the arguments and the files, and is the same minus the marks, the `context:` line and fill-ins.
 

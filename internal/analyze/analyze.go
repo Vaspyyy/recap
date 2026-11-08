@@ -112,6 +112,12 @@ func (c Change) Refs(path string) []string {
 	return refs
 }
 
+// RenameOnly reports whether a renamed symbol changed only its name: its
+// old lines, with the old name replaced by the new one, are its new lines.
+func (c Change) RenameOnly() bool {
+	return c.What == "renamed" && c.OldName != "" && len(c.OldText) > 0 && equal(renamed(c.OldText, c.OldName, c.Name), c.NewText)
+}
+
 // Ref is the definition's ref in the file at path.
 func (d Def) Ref(path string) string { return ref.Symbol(path, d.Name, d.Ordinal).String() }
 
@@ -273,13 +279,28 @@ func defs(p string, syms []outline.Symbol, lines []string) []Def {
 	return out
 }
 
-// Symbols lists a new or deleted file's top-level definitions for display.
-// Overloads next to each other are one entry, under their plain name. mark,
-// if not nil, gives the context marks printed after a name (" [failing]"),
-// by its ref.
-func (a *File) Symbols(mark func(ref string) string) []string {
-	var out, plain []string
-	var count []int
+// Entry is one name in a new or deleted file's list of definitions.
+type Entry struct {
+	Name  string   // as printed: "func List", "func parse#2"; merged overloads by their plain name
+	Note  string   // " (public)", " (from x.go)", …, or ""
+	Count int      // definitions in it: overloads next to each other are one entry
+	Refs  []string // their refs
+}
+
+// Text is the entry as printed, with marks (" [failing]") after its name.
+func (e Entry) Text(marks string) string {
+	s := e.Name + marks + e.Note
+	if e.Count > 1 {
+		s += " ×" + itoa(e.Count)
+	}
+	return s
+}
+
+// Entries lists a new or deleted file's top-level definitions for display.
+// Overloads next to each other are one entry, under their plain name.
+func (a *File) Entries() []Entry {
+	var out []Entry
+	var plain []string
 	for _, d := range a.Defs {
 		if !d.Top && d.From == "" && d.MovedTo == "" {
 			continue
@@ -297,19 +318,15 @@ func (a *File) Symbols(mark func(ref string) string) []string {
 		case a.Status == 'D' && d.Public:
 			note = " (public)"
 		}
-		marks := ""
-		if mark != nil {
-			marks = mark(d.Ref(a.Path))
-		}
-		p := label(d.Kind, d.Name) + marks + note
-		if n := len(out); n > 0 && plain[n-1] == p {
-			count[n-1]++
-			out[n-1] = p + " ×" + itoa(count[n-1]) // overloads: one entry
+		p := label(d.Kind, d.Name) + note
+		if n := len(out); n > 0 && plain[n-1] == p { // overloads: one entry
+			out[n-1].Name = label(d.Kind, d.Name)
+			out[n-1].Count++
+			out[n-1].Refs = append(out[n-1].Refs, d.Ref(a.Path))
 			continue
 		}
-		out = append(out, label(d.Kind, d.RefName())+marks+note)
+		out = append(out, Entry{Name: label(d.Kind, d.RefName()), Note: note, Count: 1, Refs: []string{d.Ref(a.Path)}})
 		plain = append(plain, p)
-		count = append(count, 1)
 	}
 	return out
 }
