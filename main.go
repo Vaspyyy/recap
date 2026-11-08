@@ -509,10 +509,10 @@ func collect(top string, comp *gitx.Comparison, untracked bool) ([]*analyze.File
 			if err != nil || !ok {
 				continue // also a file that went away
 			}
-			f := &gitx.File{Status: '?', Path: p, Added: bytes.Count(data, []byte{'\n'})}
+			f := &gitx.File{Status: '?', Path: p, Added: gitx.Lines(data)} // a symlink's lines are its target's
 			switch {
 			case link:
-				f.NewMode, f.Added = "120000", 1
+				f.NewMode = "120000"
 			case bytes.IndexByte(data[:min(len(data), 8000)], 0) >= 0:
 				f.Binary, f.Added = true, 0
 			}

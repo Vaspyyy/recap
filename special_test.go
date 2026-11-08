@@ -4,9 +4,11 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"syscall"
 	"testing"
@@ -257,5 +259,49 @@ func TestSpecialFilesAtNewPaths(t *testing.T) {
 	t.Setenv("GIT_LITERAL_PATHSPECS", "1")
 	if out, code := recapWithin(t, pipes); code != 0 || !strings.Contains(out, "\n  changed  func A  L3-5  +1 −1\n") || !strings.Contains(out, "\nold.txt  deleted") {
 		t.Errorf("GIT_LITERAL_PATHSPECS=1 hides the other changes: exit %d\n%s", code, out)
+	}
+}
+
+// An untracked file's lines are counted as git counts them once it's
+// added: a symlink's are its target's (which can hold newlines), and a
+// last line without a newline counts.
+func TestUntrackedLinesAsGitCountsThem(t *testing.T) {
+	write, commit := repo(t)
+	write("x", "x\n")
+	commit("first")
+	symlink(t, "foo\nbar", "two")   // a target with a newline in it
+	symlink(t, "foo\n", "trailing") // and one ending in a newline
+	write("nonl.txt", "a\nb")       // a last line without a newline
+	write("nl.txt", "a\nb\n")       //
+	write("empty.txt", "")          //
+	gitIn(t, ".", "add", "-A")      // what git counts...
+	numstat := map[string]int{}
+	for _, l := range strings.Split(gitOut(t, "diff", "--cached", "--numstat"), "\n") {
+		var added, removed int
+		var path string
+		if _, err := fmt.Sscanf(l, "%d\t%d\t%s", &added, &removed, &path); err == nil {
+			numstat[path] = added
+		}
+	}
+	gitIn(t, ".", "reset", "-q") // ...for files recap sees untracked
+	want := map[string]int{"two": 2, "trailing": 1, "nonl.txt": 2, "nl.txt": 2, "empty.txt": 0}
+	if !reflect.DeepEqual(numstat, want) {
+		t.Fatalf("git's numstat %v, want %v", numstat, want)
+	}
+	_, res, _ := recapJSON(t)
+	for path, n := range want {
+		f := fileByPath(t, res.Files, path)
+		if f.Added != n || f.Lines != n {
+			t.Errorf("JSON %s: added %d, lines %d; git counts %d", path, f.Added, f.Lines, n)
+		}
+	}
+	out, _ := recap(t)
+	for _, line := range []string{"two  untracked, 2 lines, symlink", "trailing  untracked, 1 line, symlink", "nonl.txt  untracked, 2 lines", "nl.txt  untracked, 2 lines"} {
+		if !strings.Contains(out, "\n"+line+"\n") {
+			t.Errorf("missing %q in\n%s", line, out)
+		}
+	}
+	if out, _ := recap(t, "--show", "two"); !strings.HasSuffix(out, "\n+foo\n+bar\n") {
+		t.Errorf("--show two: the target's two lines:\n%s", out)
 	}
 }

@@ -570,6 +570,16 @@ func ReadWorktree(path string) (data []byte, link, ok bool, err error) {
 	return data, false, err == nil, err
 }
 
+// Lines counts lines the way git diff --numstat does for a new file: one
+// per newline, and one more for a last line without one.
+func Lines(data []byte) int {
+	n := bytes.Count(data, []byte{'\n'})
+	if len(data) > 0 && data[len(data)-1] != '\n' {
+		n++
+	}
+	return n
+}
+
 // Content reads a file on one side of a comparison: in the working tree as
 // git sees it (ReadWorktree), nil for what git can't read.
 func Content(b *Blobs, top string, s Side, path string) ([]byte, error) {
