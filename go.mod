@@ -3,7 +3,7 @@ module github.com/Vaspyyy/recap
 go 1.26.0
 
 require (
-	github.com/Vaspyyy/prism v0.8.0
+	github.com/Vaspyyy/prism v0.9.0
 	golang.org/x/term v0.47.0
 )
 
