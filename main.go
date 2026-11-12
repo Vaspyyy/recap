@@ -25,7 +25,7 @@ import (
 	"github.com/Vaspyyy/recap/internal/render"
 )
 
-const version = "0.4.2"
+const version = "0.4.3"
 
 type opts struct {
 	staged, patch, agent, noUntracked bool
@@ -126,7 +126,7 @@ func parse(args []string) (*opts, int, string) {
 			i = len(args)
 		case a == "-h" || a == "--help":
 			return nil, 0, helpText(wantsColor(os.Stdout))
-		case a == "--version":
+		case a == "-V" || a == "--version":
 			return nil, 0, "recap " + version + "\n"
 		case a == "-s" || a == "--staged" || a == "--cached":
 			o.staged = true

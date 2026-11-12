@@ -43,7 +43,7 @@ var helpSections = []struct {
 	{"OTHER", []helpFlag{
 		{"", "--no-context", "", "ignore and don't record context; also PRISM_NO_CONTEXT=1"},
 		{"-h", "--help", "", "show this help"},
-		{"", "--version", "", "show the version"},
+		{"-V", "--version", "", "show the version"},
 	}},
 }
 
